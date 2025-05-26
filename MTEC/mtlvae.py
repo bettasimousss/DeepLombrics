@@ -16,22 +16,6 @@ class DVJsdm(object):
     """
     This creates a subtype of MTLVAE that models a LV-JSDM with non-linear abiotic response
     And amortized variational inference (using a VAE) for the latent variables
-    
-    List of functions remaining to implement:
-        - Conditional predictions
-        - Residual partial correlation graph (using inversion of covariance)
-        
-    Immediate extensions:
-        - Add phylogenetic and functional group information to explain abiotic response structure
-    
-    Future extensions include:
-        - Residual partial correlation graph modeled directly (as in PLN, BMazoure thesis) 
-        - VAE copula 
-        - Incorporating spatial/temporal structure using GP into encoder input to account for spatial autocorrelation
-        - Expandig the depth of the encoder-decoder 
-        - Use a discrete latent distribution (model latent groups as in LDA)
-        - Condition latent representations on environment type (conditional prior)
-        - Extension to count/relative abundance
     """
     
     def __init__(self,name,dims,nn,act,reg,diag=False):
@@ -181,7 +165,6 @@ class MTLVAE(object):
         if diag:
             paramsize=tfpl.MultivariateNormalDiag.params_size(encoded_size)
         else:
-            ##TODO: replace with appropriate function
             paramsize=tfpl.MultivariateNormalTriL.params_size(encoded_size)
         
         ### Inputs
