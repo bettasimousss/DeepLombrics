@@ -1,0 +1,4920 @@
+---
+title: "Lombrics joint model - interpretability"
+output: html_notebook
+---
+
+```{r}
+install.packages('reticulate')
+install.packages('iml')
+remotes::install_github("ddsjoberg/gtsummary")
+```
+
+Analyzing the predictions of habitat suitability using ML intepretability methods.
+
+Load the IML library and other visualization APIs
+```{r}
+library(gtsummary)
+library(reticulate)
+library(iml)
+library(ggplot2)
+library(cowplot)
+library(reshape2)
+library(ape)
+library(tibble)
+library(rjson)
+library(ggplot2)
+theme_set(theme_bw())
+library(sf)
+library(sp)
+library(mapview)
+library(raster)
+library(viridis)
+
+library(patchwork)
+#remotes::install_github("MaelTheuliere/variousdata")
+library(lwgeom)
+library(variousdata)
+library(ggspatial)
+library(tmap)
+library(raster)
+library(rgeos)
+library(metacoder)
+library(taxa)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+
+library(factoextra)
+library(FactoMineR)
+
+library(Ternary)
+library(RColorBrewer)
+data("World")
+```
+
+
+# Setup environment
+1. Reticulate python environment for RStudio
+```{r, warning=FALSE}
+use_condaenv("phd_tf2")
+py_config()
+
+setwd("D:/Data-driven/MTEC/Deep_models/application/")
+```
+
+Load helper functions to load and use the model for predictions (joint and marginal)
+
+```{r}
+source_python('ew_mtl.py')
+```
+
+
+*****************************************************************************************************************
+                                                          DATA VISUALIZATION
+*****************************************************************************************************************
+
+Calibration dataset
+```{r}
+obs=read.csv2('data/past/lien_taxa_station.csv')
+coords=read.csv2('data/past/coords_clean.csv')
+
+obs_geo=subset(merge(obs,coords,by.x = 'Id_station',by.y = 'Id_Station'),Id_station %in% sel_stations)
+obs_geo_full=merge(obs_geo,taxo_data,by.x='Id_taxon',by.y='Id_taxon')
+obs_geo_full$tname=as.character(sapply(as.character(obs_geo_full$drilo_code),function(x) map_pcodes_r[[x]]))
+obs_geo_full$spcode=paste(substring(obs_geo_full$Genus,1,1),obs_geo_full$Species,sep = '.')
+
+obs_geo_full$Sub_species=as.character(obs_geo_full$Sub_species)
+obs_geo_full$Variety=as.character(obs_geo_full$Variety)
+write.csv(obs_geo_full,'export_dfm.csv')
+
+df=cbind(obs_geo_full,env_raw[as.character(obs_geo_full$Id_station),])
+clccodes=cat_names$clc[[1]]
+names(clccodes)=as.character(cat_names$clc[[2]])
+df$clc=clccodes[as.character(df$clc)]
+
+
+unique(subset(df,clc=='MineDump')$tname)
+unique(subset(df,clc=='InlandWet')$tname)
+
+table(subset(df,tname=='Aprose')$clc)
+table(subset(df,tname=='Occyan')$clc)
+table(subset(df,tname=='LuCast_Di')$clc)
+table(subset(df,tname=='Apcupu')$clc)
+
+shap=readRDS('shaptraitdump.rds')
+shapclc=subset(shap,fname=='clc')
+shapclc$xval=clccodes[as.character(shapclc$xval)]
+
+table(subset(df,clc=='Arable')$tname)
+table(subset(shapclc,phi>0.01 & xval=='Arable')$taxa)
+
+table(subset(df,clc=='PermaCrop')$tname)
+table(subset(shapclc,phi>0.01 & xval=='PermaCrop')$taxa)
+
+table(subset(df,Sub_species=='chlorotica' & Variety=='chloro')$clc)
+table(subset(df,Sub_species=='chlorotica' & Variety=='leuco')$clc)
+table(subset(df,Sub_species=='chlorotica' & Variety=='indet')$clc)
+
+table(subset(df,Sub_species=='postepheba' & Variety=='chloro')$clc)
+table(subset(df,Sub_species=='postepheba' & Variety=='leuco')$clc)
+
+table(subset(df,tname=='Apcali')$clc)
+table(subset(df,tname=='ApCali_Al')$clc)
+table(subset(df,tname=='ApCali_Me')$clc)
+
+
+table(subset(df,tname=='AlChlo')$clc)
+table(subset(df,tname=='Apcali')$clc)
+
+rbind(
+  forest=apply(subset(shapclc,phi>0.01 & xval %in% c('Forest'))[,c('p_epigeic','p_endogeic','p_anecic')],2,mean),
+ scrubherb=apply(subset(shapclc,phi>0.01 & xval %in% c('ScrubHerbVeg'))[,c('p_epigeic','p_endogeic','p_anecic')],2,mean),
+pasture=apply(subset(shapclc,phi>0.01 & xval %in% c('Pasture'))[,c('p_epigeic','p_endogeic','p_anecic')],2,mean),
+agricultural=apply(subset(shapclc,phi>0.01 & xval %in% c('PermaCrop','Arable'))[,c('p_epigeic','p_endogeic','p_anecic')],2,mean),
+wetland=apply(subset(shapclc,phi>0.01 & xval %in% c('InlandWet'))[,c('p_epigeic','p_endogeic','p_anecic')],2,mean)
+)
+
+ew_geo <- st_as_sf(df, coords = c("Longitude", "Latitude")) %>%
+  st_set_crs(4326)
+
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+g=ggplot(data=ew_geo)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = clc))+
+  scale_color_manual(values=clccolours,name='Land cover class')+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Land cover of sampled sites')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+table(subset(df,Genus=='Scherotheca')$clc)
+
+table(subset(df,clc=='ScrubHerbVeg')$tname)
+```
+
+
+Map of observation sites coverage + taxonomic coverage
+```{r, fig.width=10}
+ew_geo <- st_as_sf(obs_geo_full, coords = c("Longitude", "Latitude")) %>%
+  st_set_crs(4326)
+
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+ew_geo$lumb=ifelse(ew_geo$Family=='Lumbricidae','Lumbricidae','Others')
+
+g=ggplot(data=ew_geo)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = Genus, size = Total),alpha=0.5)+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Earthworms occurrences')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+
+ggsave('paper/final_figures/occurrence_genus.pdf',g,width = 10)
+
+#####################################################
+#colors=as.character(unlist(sapply(ew_geo$tname,function(x) palette[[x]])))
+g1=ggplot(data=subset(ew_geo,tname %in% c('Deatte','Deocta')))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = tname, size = Total),alpha=0.5)+
+  #scale_color_manual(name="Taxa",values=unlist(palette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Earthworms occurrences')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+ggsave('paper/final_figures/occurrence_taxa_fg.pdf',g1,width = 10)
+
+g11=ggplot(data=subset(ew_geo,tname %in% c('Aprose')))+#codes))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = spcode, size = Total),alpha=0.5)+
+  scale_color_manual(name="Species",values=unlist(sppalette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Earthworms occurrences')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+ggsave('paper/final_figures/occurrence_species_fg.pdf',g11,width = 10)
+
+### Color species per latent factor clusters
+clustcol=c('#008b8b','#ff0000','#800080','#b8860b','#228b22')
+names(clustcol)=c('0','1','2','3','4')
+spassign=read.csv('empirical/best/associations/spclusters.csv',row.names = 1)
+spassign$color=sapply(spassign$cluster,function(i) clustcol[as.character(i)])
+
+spclustcols=spassign$color
+names(spclustcols)=spassign$species
+
+ew_geo=merge(ew_geo,spassign,by.x='spcode',by.y='species')
+
+g12=ggplot(data=subset(ew_geo,tname %in% codes))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color =spcode))+
+  scale_color_manual(name="Species",values=unlist(sppalette))+
+  facet_wrap(~cluster,ncol=3)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Latent clusters')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(10,"pt"),
+         legend.position = 'bottom',
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+ggsave('paper/final_figures/occurrence_species_clust.pdf',g12,width = 10,height=15)
+
+
+g=ggplot(data=subset(ew_geo,tname %in% codes))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf()+
+  #geom_sf(aes(color = spcode, size = Total),alpha=0.5)+
+  #scale_color_manual(name="Species",values=unlist(sppalette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Earthworms observations')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+ggsave('paper/final_figures/geo_coverage.pdf',g,width = 10)
+
+g=ggplot(data=subset(ew_geo,tname %in% codes))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf()+
+  geom_sf(aes(color = spcode),alpha=1)+
+  scale_color_manual(name="Species",values=unlist(sppalette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Earthworms observations')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+ggsave('paper/final_figures/geo_coverage_species.pdf',g,width = 10)
+```
+
+Current dataset
+```{r}
+curr_env=read.csv('data/current/current_env_raw.csv')
+X_curr=curr_env[,c(num_vars,cat_vars)]
+# predictor_curr = Predictor$new(model = model, data=X_curr, y = NULL,batch.size = 1024,
+#                             predict.fun = hsm_norm_predict)
+
+#l_X=lapply(1:floor(dim(X_curr)[1]/50), function(i) X_curr[i*50,])
+```
+
+Evaluation dataset
+```{r}
+cdata=data.frame(curr$Longitude,curr$Latitude,curr$scNameDrilobase,curr$taxa_id)
+colnames(cdata)=c('x','y','tname','txid')
+
+cdata_full=merge(cdata,taxo_data,by.x='txid',by.y='Id_taxon')
+cdata_full$tcode=as.character(unlist(map_pcodes_r[as.character(cdata_full$drilo_code)]))
+
+cdata_full$spcode=paste(substring(cdata_full$Genus,1,1),cdata_full$Species,sep = '.')
+spcolors=apply(as.matrix(cdata_full[c('p_epigeic','p_endogeic','p_anecic')]),1,function(x) rgb(x[1]/255,x[2]/255,x[3]/255,1))
+
+```
+
+```{r,  fig.width=10}
+ew_geo_c <- st_as_sf(cdata_full, coords = c("x", "y")) %>%
+  st_set_crs(4326)
+
+
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+g2=ggplot(data=subset(ew_geo_c,tcode %in% c('Deatte')))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = spcode),size=10)+
+  #scale_color_manual(name="Species",values = unlist(sppalette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Evaluation dataset')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         legend.position = 'right',
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+ggsave('paper/final_figures/eval_species_fg.pdf',g2,width = 10)
+
+g3=ggplot(data=ew_geo_c)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf()+
+  #geom_sf(aes(color = spcode))+
+  #scale_color_manual(name="Species",values = unlist(sppalette))+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Evaluation dataset')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         legend.position = 'right',
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+
+ggsave('paper/final_figures/eval_species.pdf',g3,width = 10)
+```
+
+Single map for occurrences
+```{r}
+ew_geo$dataset='calibration'
+ew_geo_c$dataset='evaluation'
+
+data_cols=c('black','blue')
+names(data_cols)=c('calibration','evaluation')
+
+gm=ggplot(data=rbind(ew_geo[,c('tname','spcode','geometry','dataset')],ew_geo_c[,c('tname','spcode','geometry','dataset')]))+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = dataset))+
+  scale_color_manual(name="Dataset",values = data_cols)+
+  #facet_wrap(~lumb,ncol=2)+
+  xlab('Longitude')+ylab('Latitude')+ggtitle('Geographic coverage')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         legend.position = 'right',
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+
+
+
+ggsave('paper/final_figures/geo_coverage.pdf',gm,width = 10)
+```
+
+
+
+```{r}
+OTU_data=dcast(data=obs_geo_full,tname+drilo_code~Id_station,value.var = 'Total',fun.aggregate = sum)
+OTU_taxa <- taxo_data[,c('drilo_code','Family','Genus','Species','Sub_species','Variety')]
+lin=merge(OTU_data,OTU_taxa,by='drilo_code')[,c('Family','Genus','Species','Sub_species','Variety')]
+lin[is.na(lin)]<-""
+
+
+OTU_data$lineage=sapply(1:dim(OTU_data)[1],function(i) paste(c("root",
+                                  lin$Family[i],lin$Genus[i],lin$Species[i],lin$Sub_species[i],lin$Variety[i]),collapse=";"))
+
+obj <- parse_tax_data(OTU_data,
+                      class_cols = "lineage", # the column that contains taxonomic information
+                      class_sep = ";" #,The character used to separate taxa in the classification
+                      
+)
+
+tree=obj$data$tax_data
+
+node_cols=sapply(obj$taxon_ids(),function(id){
+  tname=as.character(subset(tree,taxon_id==id)['tname'])
+  if(tname %in% codes)
+    return(as.character(palette[tname]))
+  
+  if(obj$taxon_names()[id]=="")
+    return('#ffffff')
+  else
+    return('#808080')
+})
+
+pdf("tolew.pdf")
+heat_tree(obj, 
+          node_label = taxon_names,
+          node_color = node_cols,
+          node_label_size=8,
+          node_label_color='black',
+          background_color='white',
+          #node_color = Nose, 
+          #node_size_axis_label = "Total count",
+          node_color_axis_label = "Ecological groups",
+          #layout = "davidson-harel", # The primary layout algorithm
+          initial_layout = "reingold-tilford") # The layout algorithm that initializes node locations
+dev.off()
+
+pdf("tolew_levels.pdf")
+heat_tree(obj, 
+          node_label = taxon_names,
+          node_color = n_supertaxa,
+          node_label_size=8,
+          node_label_color='black',
+          background_color='white',
+          #node_color = Nose, 
+          #node_size_axis_label = "Total count",
+          node_color_axis_label = "Ecological groups",
+          layout = "davidson-harel", # The primary layout algorithm
+          initial_layout = "reingold-tilford") # The layout algorithm that initializes node locations
+dev.off()
+```
+
+*****************************************************************************************************************
+                                                          VEGETATION
+*****************************************************************************************************************
+```{r}
+veget_meta=read.csv('data/past/station_trees.csv')
+veget=subset(read.csv('data/past/vegetation.csv',sep = ','),Id_Station  %in% sel_stations)
+treetraits=read.csv('paper/final_figures/response_groups/clc/treetraits.csv')
+
+veg_long=subset(merge(x=melt(veget[,c('Id_Station',veget_meta$Name)],id.vars = c('Id_Station')),y=veget_meta,by.x='variable',by.y='Name'),Type=='' & variable %in% treetraits$name)
+
+veg_long$species=sapply(veg_long$variable,function(x) subset(treetraits,name==x)$species[1])
+
+veg_fam=reshape2::dcast(veg_long,Id_Station ~ species , fun.aggregate = function(x) (sum(x,na.rm=T)>0)*1)
+
+### Eathworm occurrences in forests
+forest_ew=occur[as.character(veget$Id_Station),]
+colnames(forest_ew)=codes
+
+rownames(veg_fam)=veg_fam$Id_Station
+veg_fam$Id_Station=NULL
+
+#l_epigeic=names(which(colSums(forest_ew)>5))
+l_epigeic=rownames(subset(data.frame(fct_coords),p_epigeic>=0.5))
+
+#l_epigeic=codes
+
+#df=cbind((veg_fam>0)*1,forest_ew[,l_epigeic])
+
+df=subset(melt(as.matrix(veg_fam)),value>0)
+mcdf=cbind(veg=df$Var2,forest_ew[as.character(df$Var1),])
+
+rownames(mcdf)=NULL
+
+aggtraits=aggregate(treetraits[,c('leafCN','litterCN','litterDecomp','litterN','litterTannin')],by=list(species=treetraits$species),FUN=mean)
+rownames(aggtraits)=aggtraits$species
+
+mcdflong=merge(subset(melt(mcdf,variable.name='ew_taxa'),value==1 & ew_taxa %in% l_epigeic)[,c('veg','ew_taxa')],aggtraits,
+                         by.x='veg',by.y='species')
+          
+fulldf=aggregate(mcdflong[,c('leafCN','litterCN','litterDecomp','litterN','litterTannin')],by=list(ew_taxa=mcdflong$ew_taxa),FUN=function(x) mean(x[x>0],na.rm=T))
+```
+
+Add tree traits
+```{r, fig.width=8, fig.height=8}
+# ggplot(aggtraits,aes(x=leafCN,y=litterDecomp,label=species))+
+#   geom_point()+
+#   geom_text()
+
+write.csv(aggtraits,'paper/final_figures/response_groups/clc/aggtraits.csv')
+
+ggplot(aggtraits,aes(x=leafCN,y=litterDecomp,label=species))+
+  geom_point()+
+  geom_text()
+
+
+ggplot(subset(fulldf,ew_taxa!='AlChlo_PoIn'),aes(x=leafCN,y=litterDecomp,label=ew_taxa))+
+  geom_point()+
+  geom_text()
+
+
+ggplot(subset(fulldf,ew_taxa!='AlChlo_PoIn'),aes(x=litterCN,y=litterDecomp,label=ew_taxa))+
+  geom_point()+
+  geom_text()
+
+rownames(fulldf)=fulldf$ew_taxa
+pca=FactoMineR::PCA(fulldf[,c('leafCN','litterCN',
+                              'litterDecomp'#,'litterN'
+                              #'litterTannin'
+                              )])
+
+fviz_pca_biplot(pca,repel = T)
+
+pcatree=FactoMineR::PCA(aggtraits[,c('leafCN','litterCN','litterDecomp'#,'litterN'#,'litterTannin'
+                                     )])
+
+fviz_pca_biplot(pcatree,repel = T)
+```
+
+
+Multiple correspondence analysis of epigeic earthworms and vegetation
+```{r, fig.height=10, fig.width=8}
+library(factoextra)
+library(FactoMineR)
+X=aggregate(mcdf[,l_epigeic],by=list(veg=mcdf$veg),sum)
+rownames(X)=X$veg
+
+# fviz_ca_biplot (res.ca,
+#                map = "rowprincipal", arrow = c(TRUE, TRUE),
+#                repel = TRUE)
+# 
+# 
+# fviz_ca_biplot (res.ca, repel = TRUE)
+# 
+# fviz_ca_biplot(res.ca, repel = TRUE,
+#                invisible = c("row.sup", "col.sup"))
+
+tree_ew=cbind((veg_fam>0)*1,forest_ew[,l_epigeic])
+D=dist(t(tree_ew),method='binary')
+
+biplot.pcoa(pcoa(D))
+
+tree_ew_assoc=1-as.matrix(D)[l_epigeic,colnames(veg_fam)]
+
+#ape::biplot.pcoa(ape::pcoa(tree_ew_assoc))
+
+
+ggplot(melt(tree_ew_assoc))+
+  geom_tile(aes(x=Var1,y=Var2,fill=value))+
+  scale_fill_gradient2(low = 'blue',mid='white',high = 'red')+
+  theme(axis.text.x = element_text(angle=90,vjust = 0))+
+  xlab('Epigeic earthworms')+ylab('Forest vegetation')
+
+# 
+# library(igraph)
+# adjlist = subset(melt(tree_ew_assoc),value>0)
+# colnames(adjlist)=c('Source','Target','Weight')
+# graph=igraph::graph_from_edgelist(as.matrix(adjlist[,1:2]))
+# E(graph)$Weight=adjlist$Weight
+# 
+# plot.igraph(graph,layout=layout.bipartite)
+
+# nodesSet1=rownames(tree_ew_assoc)
+# nodesSet2=colnames(tree_ew_assoc)
+# 
+# # first we give prefixes to the nodes to discern the two partition
+# g <- graph.empty()
+# g <- add.vertices(g,nv=length(nodesSet1),attr=list(name=paste0('A',nodesSet1),
+#                                           type=rep(TRUE,length(nodesSet1))))
+# g <- add.vertices(g,nv=length(nodesSet2),attr=list(name=paste0('B',nodesSet2),
+#                                 type=rep(FALSE,length(nodesSet2))))
+# 
+# # we need to turn edgeList into a vector (and using names instead of indexes)
+# edgeListVec <- as.vector(t(as.matrix(data.frame(S1=paste0('A',adjlist$Source),
+#                              S2=paste0('B',adjlist$Target)))))
+# g <- add.edges(g,edgeListVec)
+# 
+# # check if is recognized as bipartite
+# is.bipartite(g)
+# 
+# # let's plot it !
+# tkplot(g, layout=layout.bipartite,
+#                vertex.color=c("darkgreen","brown")[V(g)$type+1])
+```
+
+```{r, fig.width=8, fig.height=8}
+data=X[,l_epigeic]#(X[,l_epigeic]>0)*1
+res.ca=CA(data,ncp=2) 
+
+fviz_ca_biplot (res.ca, map = "colgreen", arrow = c (TRUE, TRUE),
+               repel = TRUE)
+# fviz_ca_biplot (res.ca, map = "colgreen", arrow = c (FALSE, FALSE),
+#                 repel = FALSE)
+```
+
+*****************************************************************************************************************
+                                                ENCODING species and feature values
+*****************************************************************************************************************
+
+Categories encoding
+```{r}
+categ=lapply(cat_vars, function(c){
+  values=cat_names[[c]][[1]]
+  keys=cat_names[[c]][[2]]
+  names(values)=as.character(keys)
+  return(values)
+})
+names(categ)=cat_vars
+```
+
+
+Other taxa attributes
+Functional groups coordinates
+```{r}
+fct_coords=as.matrix(fct_groups[ret_taxa+1,]/100)
+rownames(fct_coords)=codes
+```
+
+Phylogenetic coordinates
+```{r}
+phyl_long=subset(phyl_mat,sp_id_x!=sp_id_y & sp_id_x %in% ret_taxa & sp_id_y %in% ret_taxa)
+phyl_df=dcast(phyl_long,sp_id_x + code_t_x ~ sp_id_y,value.var = 'dist',fill = 0)
+subtaxa=intersect(ret_taxa,unique(as.integer(phyl_df$sp_id_x)))
+subtaxa_names=phyl_df$code_t_x
+phyl_dist=phyl_df[,-c(1,2)]
+rownames(phyl_dist)=colnames(phyl_dist)=subtaxa
+```
+
+Functional traits
+```{r}
+tnames=codes
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+raw_traits=merge(read.csv('data/traits/prep_traits.csv',sep=','),
+             taxo[,c('Id_taxon','drilo_code')],
+             by='Id_taxon')[,-1]
+
+traitvar=c(##Ordinal
+          "Clitellum_start","Puberculum_start","Heart_start", "Morren_gland_start",
+           "Morren_gland_diverticule_location","Oesophagian_gizzard_start",
+           ##Numeric
+           "Min_length","Max_length",
+           "Min_diameter","Max_diameter",
+           "Min_weight","Max_weight",
+           "Clitellum_extension", "Puberculum_extension",
+           "Morren_gland_extension" ,"Oesophagian_gizzard_extension",
+           ##Binary
+           "Irise",
+           ## Categorical
+           "Ovisac","Morren_gland_diverticule_type",                        
+           "Typhlosole_type","Flattening","Body.wall",
+           "Muscle.structure.of.body.wall","Nephridia","Pigment"
+           )
+
+traittype=c(rep('ordinal',6),rep('numeric',11),rep('categorical',8))
+ordi_traits=traitvar[1:6]
+num_traits=traitvar[7:17]
+cat_traits=traitvar[18:25]
+
+### Aggregate by drilo_codes
+agg_traits=cbind(
+aggregate(raw_traits[,num_traits],by=list(drilo_code=raw_traits$drilo_code),
+          FUN=median),
+aggregate(raw_traits[,ordi_traits],by=list(drilo_code=raw_traits$drilo_code),
+          FUN=getmode)[ordi_traits],
+aggregate(raw_traits[,cat_traits],by=list(drilo_code=raw_traits$drilo_code),
+          FUN=getmode)[cat_traits])
+
+traits=subset(agg_traits,drilo_code %in% ret_taxa)
+traits$taxa=tnames[as.character(traits$drilo_code)]
+
+
+### Phylogenetic imputation of missing species in the traits table
+trmiss=as.character(setdiff(ret_taxa,traits$drilo_code))
+sprintf('Missing traits for %s', as.character(tnames[trmiss]))
+
+nnmiss=colnames(sort(phyl_dist[trmiss,]))[2]
+ext=subset(traits,drilo_code==nnmiss)
+rownames(ext)<-NULL
+ext$drilo_code=trmiss
+ext$taxa=tnames[trmiss]
+
+traits=rbind(traits,ext)
+rownames(traits)=NULL
+rownames(traits)=traits$drilo_code
+traits$drilo_code=NULL
+
+traits_df=traits[as.character(ret_taxa),traitvar]
+traits_df[,num_traits]=apply(traits_df[,num_traits],2,as.double)
+traits_df[,ordi_traits]=apply(traits_df[,ordi_traits],2,as.ordered)
+traits_df[,cat_traits]=apply(traits_df[,cat_traits],2,as.factor)
+```
+
+```{r}
+##Trait categorical codes
+trait_encoding=list(
+list(codes=c( 0,1,  2, 3,4, 5, 6),
+names=c('lamelated','lamelated','lamelated_pinnated','massive','pinnated','reduced','pinnated')
+),
+
+list(
+  codes=c( 0, 1, 2,3),
+    names=c('absent','weakly developed','present','well developed')
+),
+
+list(
+  codes=c(0,   1, 2, 3,4, 5,6, 7),
+  names=c('no','caudal','spearhead_caudal','clitellar','clit_caudal','clit_spearhead_caudal','clitellar2','ventral')
+),
+
+list(
+  codes=c(0, 1, 3,4),
+    names=c('weak', 'medium','medium_thick' ,'thick' )
+),
+
+list(
+  codes=c(0, 1,  2,3, 4),
+    names=c('élémentaire', 'intermédiaire',  'pavimenteux', 'penné','radiaire')
+),
+
+list(
+  codes=c( 0,3, 4, 5),
+    names=c( 'enteriform','holonnephridia', 'massive', 'metanephridia')
+),
+
+list(
+  codes=c(0,  1,2,3,4,5),
+    names=c('absent','rudimentary','unilobated','bilobated_reduced','bilobated','quadrilobated')
+),
+
+list(
+  codes=c(0,  1,2,3),
+    names=c('0','1','2','3')
+)
+)
+
+names(trait_encoding)=c(
+ 'Typhlosole_type',
+ 'Ovisac',
+ 'Flattening',
+ 'Body.wall',
+ 'Muscle.structure.of.body.wall',
+ 'Nephridia',
+ 'Morren_gland_diverticule_type',
+ 'Pigment')
+
+```
+
+*****************************************************************************************************************
+                                            ENVIRONMENTAL DATA REPORTING
+*****************************************************************************************************************
+
+```{r}
+old=env_raw
+
+new=X_curr[curr$nngrid,c(num_vars,cat_vars)]
+rownames(new)=NULL
+## add current data
+```
+
+
+Report summary statistics of environmental data
+```{r}
+##
+#X=env_raw
+#env_raw=X
+
+env_raw=rbind(old[,c(num_vars,cat_vars)],new)
+
+clccodes=unlist(cat_names$clc[[1]])
+names(clccodes)=unlist(cat_names$clc[[2]])
+
+parmacodes=unlist(cat_names$parmado[[1]])
+names(parmacodes)=unlist(cat_names$parmado[[2]])
+
+wrcodes=unlist(cat_names$wr[[1]])
+names(wrcodes)=unlist(cat_names$wr[[2]])
+
+
+erodicodes=unlist(cat_names$erodi[[1]])
+names(erodicodes)=unlist(cat_names$erodi[[2]])
+
+
+cruscodes=unlist(cat_names$crusting[[1]])
+names(cruscodes)=unlist(cat_names$crusting[[2]])
+
+## Encode categorical variables
+env_raw$clc=clccodes[as.character(env_raw$clc)]
+env_raw$parmado=parmacodes[as.character(env_raw$parmado)]
+env_raw$wr=wrcodes[as.character(env_raw$wr)]
+env_raw$erodi=erodicodes[as.character(env_raw$erodi)]
+env_raw$crusting=cruscodes[as.character(env_raw$crusting)]
+
+colnames(env_raw)=unlist(lvars)[colnames(env_raw)]
+env_raw$group=c(rep('calibration',dim(old)[1]), rep('evaluation',dim(new)[1]))
+```
+
+Summary statistics
+```{r}
+vlabs=list("Annual Mean Temperature",
+           "Mean Diurnal Range",
+           "Isothermality",
+           "Temperature Seasonality",
+           "Max Temperature of Warmest Month",
+           "Min Temperature of Coldest Month",
+           "Temperature Annual Range",
+           "Mean Temperature of Wettest Quarter",
+           "Mean Temperature of Driest Quarter",
+           "Mean Temperature of Warmest Quarter",
+           "Mean Temperature of Coldest Quarter",
+           "Annual Precipitation",
+           "Precipitation of Wettest Month",
+           "Precipitation of Driest Month",
+           "Precipitation Seasonality",
+           "Precipitation of Wettest Quarter",
+           "Precipitation of Driest Quarter",
+           "Precipitation of Warmest Quarter",
+           "Precipitation of Coldest Quarter",
+           "pH_H2O",
+           "Carbon",
+           "Carbon-to-nitrogen ratio",
+           "Clay",
+           "Silt",
+           "Proximity to water courses",
+           "Available water capacity top soil",
+           "Base saturation top soil",
+           "Cation exchange capacity top soil",
+           "Depth to gleyed horizon",
+           "Depth to impermeable layer",
+           "Packing density top soil",
+           "Crusting","Erodibility","Water regime","Dominant parent material","Land cover"
+           )
+
+names(vlabs)=unlist(lvars)[c(num_vars,cat_vars)]
+vtypes=as.list(c(rep('continuous',length(num_vars)),rep('categorical',length(cat_vars))))
+names(vtypes)=c(num_vars,cat_vars)
+
+saveRDS(list(env_raw,vlabs,vtypes),'summary_data.rds')
+
+sumtb=env_raw %>% tbl_summary(
+  label = vlabs,
+  type = vtypes,
+  #digits = list(2),
+  statistic = list(
+  all_continuous() ~ "{mean} ({sd})", #({p25},{p75})",# Q: {p25}, {median} , {p75}",
+  all_categorical() ~ "{p}%"),
+  by=group) %>% modify_header(label ~ "**Feature**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Dataset**") %>%
+  bold_labels() 
+
+as_flex_table(sumtb)
+  # as_gt() %>%
+  # gt::as_latex()
+  # add_overall()%>%
+  # add_p()
+
+print(sumtb)
+
+```
+
+
+Visualize CLC x Earthworms
+```{r}
+df=aggregate(occur,list(env_raw$clc),mean)
+df$clc=factor(clccodes[as.character(df$Group.1)],levels=cat_names$clc[[1]])
+
+rownames(df)=df$clc
+df$clc=df$Group.1=NULL
+colnames(df)=codes
+
+res.ca=FactoMineR::CA(df,5)
+
+fviz_ca_biplot (res.ca, #map = "colgreen", 
+                arrow = c (FALSE, FALSE),geom.col = 'point',
+               repel = TRUE)
+```
+
+```{r, fig.width=8, fig.height=8}
+res.ca=FactoMineR::CA(df[-c(1,10),],5)
+
+fviz_ca_biplot (res.ca, #map = "colgreen",
+                arrow = c (TRUE, FALSE),#geom.col = 'point',
+               repel = FALSE)
+```
+
+*****************************************************************************************************************
+                                       SETTING UP MODEL QUERYING ROUTINE
+*****************************************************************************************************************
+
+# Evaluation
+After setting up routines required to query the model and compute various taxa-level and community-level indicators, we next evaluate:
+- Feature importance
+- Feature effect 
+
+We will use the IML package, previously loaded. 
+
+## Predictor setup
+Before doing any analysis, since the model we use is not standard to the package, we will first configure the predictor to match our external fitted model.
+
+
+# Model querying routines
+## Taxwise habitat suitability / community composition
+```{r}
+hsm_norm_predict<-function(model,newdata){
+    X_in=normalize_env(prep,newdata)
+    y_pred=model$predict_community(X_in,vb=0)[[2]]
+    return(y_pred)
+}
+
+##Unit test
+#colnames(env_raw)=c(num_vars,cat_vars)
+#community=hsm_norm_predict(model,env_raw[,c(num_vars,cat_vars)])
+#colnames(community)=ret_taxa 
+```
+
+## Prediction of species habitat suitability
+```{r}
+species=map_sp$Species
+names(species)=map_sp$tcode
+compute_sp_hs<-function(community){
+  splist=sort(unique(as.character(species)))
+  lsc=lapply(splist,function(sp){
+    lsp=as.integer(which(species==sp))
+    if(length(lsp)==1) community[,lsp] else apply(community[,lsp],1,max)
+  })
+  
+  sp_community=data.frame(do.call(cbind,lsc))
+  colnames(sp_community)=splist
+  
+  return(sp_community)
+}
+```
+
+
+## Community-level indicators
+###Aggregated functional groups propostions
+```{r}
+compute_fct_composition<-function(community){
+  fct_compos=(community %*% fct_coords)/rowSums(community)
+  return(fct_compos)
+}
+```
+
+###Taxonomic diversity (richness)
+```{r}
+compute_taxo_diversity<-function(community,th=0.5,index='shannon'){
+  sp_community=compute_sp_hs(community)
+  tdiv=vegan::diversity((sp_community>th)*1,index=index)
+  return(tdiv)
+}
+```
+
+###Functional/phylogenetic diversity (distance-based)
+```{r}
+trait_dist=FD::gowdis(traits_df)
+phylogen_dist=as.dist(phyl_dist[as.character(subtaxa),as.character(subtaxa)])
+
+compute_fct_diversity<-function(community,dist){
+  fdiv=FD::dbFD(x=dist,a=community,
+                w.abun = FALSE,stand.x = FALSE,calc.CWM = FALSE,
+           calc.FRic = TRUE,calc.FGR = FALSE,calc.FDiv = FALSE,stand.FRic = TRUE)
+}
+```
+
+###Functional CWM
+```{r}
+compute_cwm<-function(community,mode='dom'){
+  cwm=FD::functcomp(x=traits_df,a=community,CWM.type = mode)
+  return(cwm)
+}
+```
+
+```{r}
+get_predictor<-function(pred_fun,t){
+  predictor = Predictor$new(model = model, data=X, y = NULL, class=t,batch.size = nrow(X),
+                              predict.fun = pred_fun)
+  
+  return(predictor)
+}
+```
+
+
+*****************************************************************************************************************
+                                        PREDICTIVE PERFORMANCES
+*****************************************************************************************************************
+```{r, fig.height=10}
+th_sel=read.csv('th_selection_med.csv',row.names = 1)
+selection=read.csv('selected.csv')
+
+sel_th=selection$threshold
+names(sel_th)=selection$Target
+
+levs=selection$Target[order(selection$AUCMTEC,decreasing = F)]
+selection$taxa=factor(selection$Target,levels = levs)
+
+p1=ggplot(selection,aes(x=AUCMTEC,y=taxa))+#,fill=taxa))+
+  geom_bar(stat='identity')+
+  xlab('ROC AUC')#%+
+  #scale_fill_manual(values=taxcolors)+
+  #facet_wrap(~metric)
+
+p2=ggplot(selection,aes(x=TSSMTEC,y=taxa))+#,fill=taxa))+
+  geom_bar(stat='identity')+
+  xlab('TSS')#%+
+
+gridExtra::grid.arrange(p1,p2,ncol=2)
+#lemon::grid_arrange_shared_legend(p1,p2,ncol=2)
+
+pdf('paper/final_figures/prediction/threshold_selection.pdf',height = 10)
+ggplot(th_sel, aes(x=th))+
+  geom_line(aes(y=sensitivity),col='red')+
+  geom_line(aes(y=specificity),col='blue')+
+  geom_line(aes(y=tss),color='black')+
+  geom_line(aes(y=bacc),color='orange')+
+  facet_wrap(~taxa,ncol=7)+
+  ylab('Sensitivity(red), Specificity (blue), TSS (black), Balanced Accuracy (orange)')+
+  ggtitle('Performance-based threshold selection')
+
+dev.off()
+```
+
+Evaluation performances with optimal threshold
+```{r, fig.height=10,fig.width=5}
+y_eval=model$predict_community(eval_dataset[['X']],vb = 0)[[2]]
+colnames(y_eval)=codes
+idx=do.call(cbind,eval_dataset[['y']])+1
+
+##th = 0.5
+recall_eval=c(mean(y_eval[idx]>0.5))
+
+l_th=c()
+for( met in c('tss')){
+  for(tax in codes){
+    sel=subset(th_sel,taxa==tax)
+    th=min(sel[sel[,met]>=max(sel$tss),'th'])
+    
+    l_th=c(l_th,th)
+  }
+}
+
+names(l_th)=codes
+#     #l_th=sel$th#sapply(sel$th,function(t) min(t,0.75))
+#     names(l_th)=as.character(sel$taxa)
+#     bin_eval=data.frame(t(apply(y_eval,1,function(x) x>=l_th)*1))
+#   
+#     recall_eval=c(recall_eval,mean(sapply(1:1126,function(i) bin_eval[i,idx[i,2]])))
+#   }
+# }
+
+# names(recall_eval)=c('single05','tss','f1','bacc')
+# 
+# print(recall_eval)
+
+## Selected
+l_th=sapply(l_th,function(t) min(t,0.5))
+#names(l_th)=as.character(selection$taxa)
+
+
+bin_eval=data.frame(t(apply(y_eval,1,function(x) x>=l_th[codes])*1))[idx]
+print(mean(bin_eval))
+
+## Taxwise
+pred=data.frame(cbind(idx,bin_eval))
+colnames(pred)=c('site','taxa','class')
+pred$tname=codes[pred$taxa]
+
+ggplot(aggregate(. ~ tname, pred[,c('tname','class')], mean))+
+  geom_bar(aes(y=reorder(tname,class),x=class),stat='identity')
+
+
+mean(subset(aggregate(. ~ tname, pred[,c('tname','class')], mean),class>0)$class)
+
+subset(aggregate(. ~ tname, pred[,c('tname','class')], mean),class<0.5)
+
+### 
+data=data.frame(cbind(prob=as.numeric(y_eval[idx]),tname=codes[idx[,2]]))
+data$prob=as.numeric(data$prob)
+# ggplot(data,aes(y=tname,x=prob))+
+#   geom_boxplot(orientation = 'horizontal')+
+#   ggtitle('Evaluation scores')
+
+df=cbind(setdiff(codes,df$tname),0)
+colnames(df)=c('tname','class')
+evaldf=rbind(aggregate(. ~ tname, pred[,c('tname','class')], mean),df)
+
+write.csv(evaldf,'paper/final_figures/prediction/eval_scores.csv')
+
+```
+
+
+<!-- BIOMOD PROJECTIONS -->
+
+<!-- ```{r} -->
+<!-- biomod=read.csv('biomod_eval/biomod_predictions.csv',row.names = 1) -->
+<!-- l_taxa=match$sp_id -->
+<!-- names(l_taxa)=match$taxa_id -->
+<!-- biomod$tcode=as.numeric(l_taxa[biomod$Id_taxon]) -->
+<!-- biomod$tname=taxa_names[biomod$tcode+1] -->
+<!-- #biomod=subset(biomod,tcode %in% ret_taxa) -->
+<!-- biomod$short=as.character(unlist(map_pcodes_r)[as.character(biomod$tcode)]) -->
+
+<!-- ev_prob=biomod[,c('proba','tcode','tname','short')] -->
+
+<!-- ggplot(subset(ev_prob,proba>=0),aes(x=short,y=proba))+ -->
+<!--   geom_boxplot()+ -->
+<!--   theme(axis.text.x = element_text(angle=90)) -->
+<!--   ggtitle('BIOMOD scores') -->
+
+<!-- median((ev_prob$proba>=0.5)*1,na.rm=T) -->
+<!-- ``` -->
+
+
+*********************************************************************************************************************************
+                            SUMMARY OF AVERAGE PERFORMANCES ACROSS TAXA (RADAR CHART for all models)
+*********************************************************************************************************************************
+Load all results
+```{r}
+synthesis=read.csv('paper/final_figures/prediction/summary.csv',row.names = 1)
+sjoint=read.csv('paper/final_figures/prediction/ssdm_jsdm_scores.csv',row.names = 1)
+levs=rownames(sjoint)[order(sjoint$Prevalence,decreasing = F)]
+sjoint$taxa=factor(rownames(sjoint),levels = levs)
+```
+
+```{r, fig.height=10}
+df=melt(sjoint,id.vars = c('taxa','Prevalence','threshold'))
+ggplot(subset(df,variable %in% c('MTEC_AUC','GLM_AUC','GBM_AUC','RF_AUC')), aes(y=taxa,x=value,fill=variable))+
+  geom_bar(stat = 'identity')+
+  facet_wrap(~variable,ncol=4)#+
+  #theme(axis.text = element_text(angle=90))
+
+ggplot(subset(df,variable %in% c('MTEC_TSS','GLM_TSS','GBM_TSS','RF_TSS')), aes(y=taxa,x=value,fill=variable))+
+  geom_bar(stat = 'identity')+
+  facet_wrap(~variable,ncol=4)#+
+  #theme(axis.text = element_text(angle=90))
+```
+
+
+Create radar chart
+4 models * 3 prep strategies * 3 metrics (AUC, TSS, RECALL)
+```{r, fig.width=10}
+library(ggradar)
+mperf=c('TSS','AUC','RECALL')
+
+g1=ggradar(subset(synthesis,preprocessing=='None')[,c('Architecture',mperf)],axis.label.size = 5)
+g2=ggradar(subset(synthesis,preprocessing=='PCA')[,c('Architecture',mperf)],axis.label.size = 5)
+g3=ggradar(subset(synthesis,preprocessing=='VIF')[,c('Architecture',mperf)],axis.label.size = 5)
+
+g1
+g2
+g3
+
+lemon::grid_arrange_shared_legend(g1,g2,g3,ncol=3)
+
+```
+
+
+*****************************************************************************************************************
+                                TAXA RESPONSE AND SITE EFFECT GROUPS
+*****************************************************************************************************************
+
+```{r}
+library(tsne)
+library(FactoMineR)
+library(ggpubr)
+library(factoextra)
+
+emb=read.csv('site_sp_emb.tsv',sep='\t')
+
+site_emb=emb[1:n,]
+sp_emb=emb[(n+1):(n+m),]
+meta=read.csv('metadata_emb.tsv',sep='\t')
+
+rownames(sp_emb)=meta$id[(n+1):(n+m)]
+rownames(site_emb)=sel_stations
+
+sp_emb=t(read.csv('checkpoints/sp_emb.txt',sep='\t',header = F))
+rownames(sp_emb)=codes
+```
+
+```{r}
+### Visualize species ######
+pdf('paper/final_figures/response_groups/tsne_sp.pdf')
+for(perp in c(5,6,7,8,9,10,15,20)){
+  sp_coords=data.frame(tsne(sp_emb,perplexity = 10))
+  sp_coords$taxa=rownames(sp_emb)
+  g=ggplot(sp_coords,aes(x=X1,y=X2,col=taxa))+
+    geom_point()+
+    geom_text(aes(label=taxa),hjust=0, vjust=0)+
+    scale_color_manual(values=taxcolors)+
+    theme(legend.position = 'hidden')+xlab('TSNE1')+ylab('TSNE2')+ggtitle(sprintf('T-SNE %d',perp))
+  
+  print(g)
+}
+dev.off()
+
+sp_pca=FactoMineR::PCA(sp_emb,ncp = 2)
+g=ggplot(cbind(data.frame(sp_pca$ind$coord[,1:2]),taxa=rownames(sp_emb)),aes(x=Dim.1,y=Dim.2,col=taxa))+
+  geom_point()+
+  geom_text(aes(label=taxa),hjust=0, vjust=0)+
+  scale_color_manual(values=taxcolors)+
+  theme(legend.position = 'hidden')+xlab('PCA1')+ylab('PCA2')+ggtitle('PCA')
+
+ggsave('paper/final_figures/response_groups/pca_species.png',g)
+
+#### Clustering species
+pdf('paper/final_figures/response_groups/emb_groups_nr.pdf')
+for(nc in c(2,3,4,5)){
+  hc.sp=hcut(sp_emb,nc)
+  p=fviz_cluster(hc.sp,sp_emb,repel = T,show.clust.cent = T,ellipse.type = 'none')
+  plot(p)
+  
+  respgroups=data.frame(hc.sp$cluster)
+}
+dev.off()
+
+hc.sp=hcut(sp_emb,5)
+respgroups=data.frame(hc.sp$cluster)
+spclust=caret::class2ind(as.factor(respgroups$hc.sp.cluster))
+```
+
+Relating response groups to traits and ecological categories
+```{r,fig.height=15, fig.width=8}
+plot(hc.sp)
+ggdendro::ggdendrogram(as.dendrogram(hc.sp),rotate = T)+
+  theme(axis.text = element_text(color='black',size = 12))
+```
+
+Plot response groups in ternary plot
+```{r, fig.height=8,fig.width=8}
+fg_raw$rg=respgroups[fg_raw$taxa,]
+
+data_points <- lapply(1:dim(fg_raw)[1],function(i) as.numeric(fg_raw[i,c('p_epigeic','p_endogeic','p_anecic')]))
+names(data_points) <- fg_raw$taxa
+
+rgcols=c('#F8766D','#A3A500','#00BF7D','#0BB2F5','#E771F2')
+names(rgcols)=as.character(1:5)
+
+TernaryPlot(alab="Epigeic \u2192", blab="\u2190 Endogeic", clab="Anecic \u2192",
+            lab.col=c('black', 'black', 'black'),
+            point='right', lab.cex=1, grid.minor.lines=0,
+            grid.lty='solid', col=rgb(0.9, 0.9, 0.9), grid.col='white', 
+            axis.col=rgb(0.6, 0.6, 0.6), ticks.col=rgb(0.6, 0.6, 0.6),
+            padding=0.08)
+
+AddToTernary(points, data_points, pch=16, cex=2,
+             col=as.character(rgcols[fg_raw$rg])
+             # col=vapply(names(data_points), 
+             #           function (x) rgcols[x],
+             #           character(1))
+)
+```
+
+
+
+Project response groups
+```{r}
+y_curr=data.frame(hsm_norm_predict(model,X_curr))
+
+### current groups
+y_g=data.frame(as.matrix(y_curr) %*% spclust)
+c_g=y_g/rowSums(y_g)
+
+### past groups
+p_g=(as.matrix(Y) %*% spclust) / rowSums(Y)
+rownames(p_g)=NULL
+
+geo=coords[rownames(Y),]
+colnames(geo)=c('y','x')
+
+p_g_geo=cbind(geo,as.matrix(p_g))
+
+c_g_geo=cbind(data.frame(x=curr_env$Longitude,y=curr_env$Latitude),c_g)
+
+```
+
+Map response groups
+```{r}
+p_g_long=melt(p_g_geo,id.vars = c('x','y'))
+c_g_long=melt(c_g_geo,id.vars = c('x','y'))
+
+p_g_geo$cl=as.numeric(apply(p_g_geo[,as.character(1:5)],1,which.max))
+c_g_geo$cl=as.numeric(apply(c_g_geo[,3:7],1,which.max))
+
+plot_rg<-function(df){
+  gbr <- getData("GADM", country="FR", level=0)
+  gbr <- gSimplify(gbr, 0.01)
+  gbr_map <- fortify(gbr)
+  
+  ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+      st_set_crs(4326)
+  
+  g=ggplot(ew_geo)+
+      geom_map(map=gbr_map, data=gbr_map,
+                       aes(x=long, y=lat, map_id=id),
+                       fill='#ffffff',
+                       col="#000000")+
+      xlab('Longitude')+ylab('Latitude')+
+      geom_sf(aes(col=as.factor(cl)))+#aes(color=ew_geo$variable))+
+      scale_color_manual(values=rgcols)+
+      #scale_color_gradient(low="white", high="red")+
+      #scale_fill_gradient(low="white", high="red")+
+      facet_wrap(~cl,ncol=3)+
+      theme(legend.position = 'right',legend.text = element_text(size=9),axis.text.x = element_text(angle=90))+
+      ggtitle('Response groups')
+  
+  g
+}
+
+plot_rg(p_g_geo)
+plot_rg(c_g_geo)
+#plot_rg(p_g_long)
+#plot_rg(c_g_long)
+```
+
+
+
+Predict embeddings on current data
+```{r}
+library(clue)
+kmmodel=res.km
+
+X_in=normalize_env(prep,X_curr)
+curr_pred=model$predict_community(X_in,vb=0)
+curr_site_emb=data.frame(curr_pred[[1]])
+```
+
+
+```{r}
+### Clustering sites
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+set.seed(123)
+
+pdf('paper/final_figures/response_groups/Site_clustering.pdf')
+for(nc in c(2,3,4,5,6)){
+res.km <- kmeans(site_emb, nc, nstart = 25)
+p=fviz_cluster(res.km, data = site_emb,
+             #palette = c("#2E9FDF", "#00AFBB", "#E7B800"), 
+             geom = "point",
+             ellipse.type = "convex", 
+             ggtheme = theme_bw(),
+             main = sprintf('Site, kMeans %d',nc)
+             )
+
+print(p)
+
+### Apply clustering prediction
+curr_kcluster=cl_predict(res.km,newdata = curr_site_emb)
+
+## Viz on map
+geodata=data.frame(cbind(x=env_raw$Longitude,y=env_raw$Latitude,cluster=as.numeric(res.km$cluster)))
+site_geo <- st_as_sf(geodata, coords = c("x", "y")) %>%
+  st_set_crs(4326)
+
+g=ggplot(data=site_geo)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = as.factor(cluster)))+
+  scale_color_brewer(name='Cluster',palette='Dark2')+
+  xlab('Longitude')+ylab('Latitude')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))+
+  ggtitle(sprintf('Site clusters (kMeans) %d',nc))
+
+
+cgeodata=data.frame(cbind(x=curr_env$Longitude,y=curr_env$Latitude,cluster=as.numeric(curr_kcluster)))
+csite_geo <- st_as_sf(cgeodata, coords = c("x", "y")) %>%
+  st_set_crs(4326)
+
+gc=ggplot(data=csite_geo)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = as.factor(cluster)))+
+  scale_color_brewer(name='Cluster',palette='Dark2')+
+  xlab('Longitude')+ylab('Latitude')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))+
+  ggtitle(sprintf('Environmental types'))
+
+lemon::grid_arrange_shared_legend(g,gc,ncol=2,plot = T)
+}
+
+for(nc in c(2,3,4,5,6)){
+res.hc<-hcut(site_emb,k=nc)
+p2=fviz_cluster(res.hc, data = site_emb,
+             #palette = c("#2E9FDF", "#00AFBB", "#E7B800"), 
+             geom = "point",
+             ellipse.type = "convex", 
+             ggtheme = theme_bw(),
+             main = sprintf('Site, Hclust %d',nc)
+             )
+
+print(p2)
+
+## Viz on map
+geodata=data.frame(cbind(x=env_raw$Longitude,y=env_raw$Latitude,cluster=as.numeric(res.hc$cluster)))
+site_geo <- st_as_sf(geodata, coords = c("x", "y")) %>%
+  st_set_crs(4326)
+
+g=ggplot(data=site_geo)+
+  geom_map(map=gbr_map, data=gbr_map,
+                    aes(x=long, y=lat, map_id=id),
+                    fill='#ffffff',
+                    col="#000000")+
+  geom_sf(aes(color = as.factor(cluster)))+
+  scale_color_brewer(name='Cluster',palette='Dark2')+
+  xlab('Longitude')+ylab('Latitude')+
+  theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+         legend.key.size = unit(12,"pt"),
+         strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))+
+  ggtitle(sprintf('Site clusters (Hclust) %d',nc))
+
+print(g)
+}
+
+dev.off()
+
+```
+
+Cluster based on current conditions
+```{r}
+pdf('current_site_clusters.pdf')
+for(nc in c(2,3,4,5,6)){
+  km.curr=kmeans(curr_site_emb, nc, nstart = 25)
+  cgeodata=data.frame(cbind(x=curr_env$Longitude,y=curr_env$Latitude,cluster=as.numeric(km.curr$cluster)))
+  csite_geo <- st_as_sf(cgeodata, coords = c("x", "y")) %>%
+    st_set_crs(4326)
+  
+  gc=ggplot(data=csite_geo)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    geom_sf(aes(color = as.factor(cluster)))+
+    scale_color_brewer(name='Cluster',palette='Dark2')+
+    xlab('Longitude')+ylab('Latitude')+
+    theme( axis.text = element_text( size = 12 ),
+             axis.title = element_text( size = 12, face = "bold" ),
+           legend.key.size = unit(12,"pt"),
+           strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))+
+    ggtitle(sprintf('Environmental types - current'))
+  
+  print(gc)
+}
+dev.off()
+```
+
+*****************************************************************************************************************
+                                      RESPONSE GROUPS , FUNCTIONAL GROUPS, TRAITS
+*****************************************************************************************************************
+```{r}
+fct_df=cbind(fg_raw,sp_emb,traits_df)
+fct_df$color_fg=as.character(taxcolors[fct_df$taxa])
+
+for (tr in cat_traits){
+  labels=trait_encoding[[tr]]$names
+  names(labels)=trait_encoding[[tr]]$codes
+  fct_df[,tr]=as.character(labels[fct_df[,tr]])
+}
+
+```
+
+Summarize traits per response group
+```{r}
+summ=lapply(1:5,function(g){
+  subdf=subset(fct_df,rg==g)
+  
+  gsum=list(
+  ## Ecological strategies
+  ef=colMeans(subdf[,colnames(fct_coords)]),
+  ## Numerical traits
+  nt=describe(subdf[,num_traits]),
+  
+  ## Categorical traits
+  ct=Hmisc::describe(subdf[,cat_traits])
+  )
+  
+  gsum
+})
+
+
+## Continuous traits
+ggplot(melt(fct_df[,c('rg','taxa',num_traits)],id.vars = c('rg','taxa')))+
+  geom_boxplot(aes(x=variable,y=value,col=as.factor(rg)))+
+  #geom_point(aes(x=variable,y=value,col=as.factor(rg)),position='jitter')+
+  facet_wrap(~variable,scales = 'free',ncol=4)+
+  scale_color_manual(values=rgcols,name='Response group')+
+  ggtitle('Traits distribution within response groups')
+
+
+## Ecological categories
+eg_rg=aggregate(fct_df[,colnames(fct_coords)],list(group=fct_df$rg),mean) 
+
+egcols=c('darkred','darkgreen','darkblue')
+names(egcols)=c('p_epigeic','p_endogeic','p_anecic')
+
+ggplot(melt(eg_rg,id.vars = c('group')))+
+  geom_bar(aes(y=value,fill=variable,x=group),stat = 'identity')+
+  scale_fill_manual(name='Ecological\ngroup',values=egcols)+
+  xlab('Response group')+
+  ylab('Average class proportions')+
+  ggtitle('Ecological categories distribution within response groups')
+
+```
+
+```{r, fig.height=8,fig.width=10}
+## Categorical traits
+df=melt(fct_df[,c('rg','taxa',cat_traits)],id.vars = c('rg','taxa'))
+
+ggplot(df,aes(x=value,fill=as.factor(rg)))+
+  geom_bar(stat='count')+
+  facet_wrap(~variable,scales = 'free',ncol=3)+
+  scale_fill_manual(values=rgcols)+
+  theme(axis.text = element_text(angle=45))
+```
+
+
+Relating response groups to specific traits and ecological strategies
+```{r}
+df=apply(fct_df[,c(colnames(fct_coords),colnames(sp_emb),num_traits)],2,as.numeric)
+corrplot::corrplot(cor(x=df[,colnames(sp_emb)],y=df[,c(colnames(fct_coords),num_traits)]),sig.level = 0.05,insig = "blank")
+```
+
+
+*****************************************************************************************************************
+                                                        LATENT FACTORS
+*****************************************************************************************************************
+
+Associations
+```{r}
+res_cor=read.csv('empirical/best/associations/corhat.csv',row.names = 1)
+clusters=read.csv('empirical/best/associations/clusters.csv',row.names = 1)
+clusters$code=as.character(sapply(clusters$taxa,function(c) map_pcodes[[c]]))
+
+clust_full=cbind(unique(
+  merge(clusters,taxo_data[,c('drilo_code','Family','Genus','Species','Sub_species','Variety')],by.x='code',by.y='drilo_code')),
+  fct_coords[clusters$code,])
+```
+
+```{r}
+# Colour the background
+display.brewer.pal(5, 'Set1')
+palette=RColorBrewer::brewer.pal(5,'Set1')
+
+palette=c('orange','darkmagenta','cyan','red','springgreen4')
+```
+
+```{r, fig.width=10}
+## Plot taxa in triangle, color according to clusters
+# Add data points
+data_points <- lapply(1:dim(clust_full)[1],function(i) as.numeric(clust_full[i,c('p_epigeic','p_endogeic','p_anecic')]))
+names(data_points) <- clust_full$taxa
+
+
+cols=palette[clust_full$cluster+1]
+names(cols)=clust_full$taxa
+
+
+TernaryPlot(alab="Epigeic \u2192", blab="\u2190 Endogeic", clab="Anecic \u2192",
+            lab.col=c('red', 'darkgreen', 'blue'),
+            point='right', lab.cex=0.8, grid.minor.lines=0,
+            grid.lty='solid', col=rgb(0.9, 0.9, 0.9), grid.col='white', 
+            axis.col=rgb(0.6, 0.6, 0.6), ticks.col=rgb(0.6, 0.6, 0.6),
+            padding=0.08)
+
+AddToTernary(points, data_points, pch=10, cex=2,
+             col=vapply(names(data_points), 
+                       function (x) cols[x],
+                       character(1))
+)
+
+```
+
+*****************************************************************************************************************
+                                               PIMP FEATURE IMPORTANCE
+*****************************************************************************************************************
+
+## Feature importance
+Various measures of environmental variables importance for taxa HS evaluation by the fitted model
+### Permutation feature importance
+
+Feature esthetics
+```{r}
+fcolors=c('grey','blue','cyan4','darkgreen','darkred','chocolate')
+names(fcolors)=c("temperature" ,  "precipitation" ,"hydro"   ,      "physchem"   ,   "landcover"  ,   "structural")
+
+
+feat_order=do.call(c,lapply(c("hydro"   ,  "landcover" ,    "physchem"   , "structural", "precipitation" , "temperature" ), function(g){
+  print(g)
+  vars=rownames(vargroups)[which(vargroups$group==g)]
+  nvars=as.character(unlist(lvars)[vars])
+  return(nvars[order(nvars)])
+}))
+```
+
+ Load precomputed feature importance values
+```{r}
+imp_tasks<-read.csv('empirical/iml/pim_tasks_auc.csv',row.names = 1)
+imp_overall_macro<-read.csv('empirical/iml/pim_overall_auc_macro.csv',
+                            row.names = 1)
+imp_overall_weighted<-read.csv('empirical/iml/pim_overall_auc_weighted.csv',
+                            row.names = 1)
+```
+
+Setting up tasks (taxa) names, feature types and categories encoding
+```{r}
+tnames=rownames(imp_tasks)
+fullnames=taxa_names[ret_taxa+1]
+ftypes=c(rep("numerical",length(num_vars)),rep("categorical",length(cat_vars)))
+names(ftypes)=c(num_vars,cat_vars)
+
+names(tnames)=ret_taxa
+species=sapply(ret_taxa, function(t) unique(subset(taxo,drilo_code==t)$Species))
+genus=sapply(ret_taxa, function(t) unique(subset(taxo,drilo_code==t)$Genus))
+names(species)=names(genus)=ret_taxa
+```
+
+#### Community level
+```{r}
+plot_pimp<-function(imp_overall,palette,titre=''){
+  data=melt(imp_overall)
+  data$variable=as.character(data$variable)
+  data$group=vargroups[data$variable,]
+  data$fname=factor(unlist(lapply(data$variable,function(v) lvars[[v]])),levels = feat_order)
+  
+  g<- ggplot(data,mapping = aes(x=fname,y=value,color=group))+
+    geom_boxplot()+
+    scale_color_manual(values=palette)+
+    #scale_fill_manual(values = unlist(colors))+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    xlab('Environmental features')+ylab('Permutation feature importance')+
+    ggtitle(titre)
+  
+  g
+}
+
+plot_pimp(imp_overall_macro,palette=unlist(colors),titre = 'Community-level feature importance')
+plot_pimp(imp_overall_weighted,palette=unlist(colors),titre = 'Community-level feature importance (weighted)')
+
+pdf('paper/final_figures/pimp.pdf')
+plot_pimp(imp_overall_macro,palette=fcolors,titre = 'Community-level feature importance')
+plot_pimp(imp_overall_weighted,palette=fcolors,titre = 'Community-level feature importance (weighted)')
+dev.off()
+```
+TOP 5 features are:
+(CLC,pH+CN,PWetM+PWetQ,TIso+TRngY)
+
+#### Taxa-level 
+Is there a pattern amongst similar functional groups or phylogenetically close species when it comes to feature importance ?
+
+-Cumulative feature importance
+-Rows in 
+ *alphabetic order ensure same genus + same species are close together (allows to test taxonomic structure)
+ *phylogenetic order 
+ *functional order
+```{r, fig.width=10,fig.height=10}
+imp_tasks$species=species
+imp_tasks$taxa=rownames(imp_tasks)
+rownames(imp_tasks)=NULL
+
+data=melt(imp_tasks)
+data$variable=as.character(data$variable)
+data$group=vargroups[data$variable,]
+data$fname=unlist(lapply(data$variable,function(v) lvars[[v]]))
+data$tname=codes[as.integer(data$taxa)]
+
+#data$tname=factor(data$tname,levels = levs)
+ggplot(data,aes(y=tname,x=abs(value),fill=group))+
+  scale_fill_manual(values=fcolors)+
+  geom_bar(position="stack", stat="identity")+
+  xlab('Stacked permutation feature importance')+ylab('Earthworm taxa')
+  
+```
+
+*****************************************************************************************************************
+                                              SHAP FEATURE IMPORTANCE
+*****************************************************************************************************************
+
+
+### SHAPLEY VALUES and SHAP
+We compute for each instance, the shapley values of each feature wrt each task (taxa)
+```{r}
+run_shap=F
+if(run_shap){
+predictor = Predictor$new(model = model, data=X, y = NULL,batch.size = nrow(X),
+                            predict.fun = hsm_norm_predict)
+
+all_shapley<-lapply(1:dim(X)[1], function(i) {
+  shapley <- Shapley$new(predictor, x.interest = X[i, ])$results
+  shapley$instance<-i
+  return(shapley)
+})
+
+saveRDS(all_shapley,file='empirical/iml/shap/shapley_full.rds')
+}
+```
+
+```{r}
+run_shap=F
+if(run_shap){
+cols=c("feature"   ,    "class"     ,    "phi","phi.var"     ,  "feature.value","site")
+
+shap_global=dataframe(do.call(rbind,lapply(1:dim(X)[1], function(i){
+  df=do.call('cbind',lapply(((i-1)*6+1):(i*6), function(j) all_shapley[[j]]))
+  colnames(df)=cols
+  return(df)
+})))
+
+write.csv(data.frame(shap_global),'shapley_global.csv')
+}
+```
+
+
+
+Global interpretation: based on aggregated shapley values
+```{r}
+shap_global=read.csv('empirical/iml/shap/shapley_global.csv',row.names = 1)
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+
+scale_x_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_x_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+
+scale_y_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_y_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+```
+
+#### SHAP importance (cumulated absolute values across instances)
+```{r,fig.width=20,fig.height=40}
+shap_imp=aggregate(shap_global[,c('phi')],by=list(shap_global$feature,shap_global$class),
+                   FUN=function(x) sum(abs(as.numeric(x))))
+
+colnames(shap_imp)<-c('feature','task','shap_phi')
+
+n=dim(X)[1]
+
+shap_imp$fname=unlist(lapply(shap_imp$feature,function(v) lvars[[v]]))
+shap_imp$group=vargroups[shap_imp$feature,]
+shap_imp$taxa=as.character(tnames)[as.integer(shap_imp$task)]
+
+
+ggplot(shap_imp,aes(y=reorder_within(fname,shap_phi/n,taxa),x=shap_phi/n,fill=group))+
+  geom_bar(stat='identity')+
+  scale_y_reordered() +
+  scale_fill_manual(name='Feature group',values=fcolors)+
+  theme(axis.text.x = element_text(angle = 45))+
+  facet_wrap(~taxa,ncol=7,scales='free_y')+
+  ggtitle('SHAP global feature contributions')
+
+```
+
+
+```{r, fig.width=8, fig.height=10}
+### Stack values
+prevs=colMeans(Y)
+names(prevs)=codes
+lev2=codes[order(prevs,decreasing = T)]
+shap_imp$taxaf=factor(shap_imp$taxa,levels = lev2)
+g1=ggplot(shap_imp,aes(y=taxaf,x=abs(shap_phi)/n,fill=group))+
+  scale_fill_manual(name='Feature group',values=fcolors)+
+  #geom_text(aes(label=fname), vjust=0) +
+  geom_bar(position="stack", stat="identity")+
+  theme(axis.text = element_text(colour='black',size = 8))+
+  xlab('Stacked SHAP feature importance')+ylab('Earthworm taxa')+
+  ggtitle('Taxwise accumulated feature importance')
+
+ggsave('shapimp.png',g1)
+```
+
+
+```{r}
+g2=ggplot(shap_imp,aes(y=reorder(fname,shap_phi/n),x=shap_phi/n,fill=group))+
+  geom_boxplot()+
+  scale_y_reordered() +
+  scale_fill_manual(name='Feature group',values=fcolors)+
+  theme(axis.text.x = element_text(angle = 45),axis.text = element_text(colour='black',size=8))+
+  #ggtitle('Global feature contributions')+
+  ylab('Feature')+xlab('Average absolute SHAP across sites')+
+  ggtitle('Overall feature importance')
+
+ggsave('paper/final_figures/shappastimp.pdf',g,width =10 ,height = 10)
+```
+
+```{r, fig.height=8}
+lemon::grid_arrange_shared_legend(g2,g1,ncol=2,position = 'bottom')
+```
+
+
+*****************************************************************************************************************
+                                              SHAP RESPONSE
+*****************************************************************************************************************
+
+#### SHAP summary
+```{r, fig.height=10,fig.width=8}
+shap_global$fname=unlist(lapply(shap_global$feature,function(v) lvars[[v]]))
+shap_global$group=vargroups[shap_global$feature,]
+shap_global$taxa=as.character(tnames)[as.integer(shap_global$class)]
+shap_global$species=as.character(species)[as.integer(shap_global$class)]
+
+shap_global$xval=sapply(shap_global$feature.value,
+                        function(x) as.numeric(unlist(strsplit(x,'='))[2]))
+```
+
+Questions
+- Is there a phylogenetic/functional structure in the SHAP values ?
+- Is there a relationship between top features by SHAP contribution and the prevalence/geographic extent ? 
+
+Selected top features
+(CLC,pH+CN,PWetM+PColdQ,TIso+TRngY)
+```{r}
+top_vars=c('clc','pH','CN','bio_13','bio_7','awc_top','crusting','clay','silt')
+```
+
+Phylogenetic and functional-groups and traits distance-based clusters 
+```{r, fig.height=8, fig.width=5}
+pdis=phyl_dist
+colnames(pdis)=rownames(pdis)=subtaxa_names
+
+fdis=1-cosine_similarity(fct_coords)
+rownames(fdis)=colnames(fdis)=as.character(tnames)
+
+#rownames(traits_df)=as.character(tnames[rownames(traits_df)])
+tdis=as.matrix(FD::gowdis(traits_df))
+
+```
+
+Custom colors to functional groups
+
+```{r, fig.width=10,fig.height=10}
+library(Ternary)
+TernaryPlot(alab="Epigeic \u2192", blab="\u2190 Endogeic", clab="Anecic \u2192",
+            lab.col=c('red', 'darkgreen', 'blue'),
+            point='right', lab.cex=5, grid.minor.lines=0,
+            grid.lty='solid', col=rgb(0.9, 0.9, 0.9), grid.col='white', 
+            axis.col=rgb(0.6, 0.6, 0.6), ticks.col=rgb(0.6, 0.6, 0.6),
+            padding=0.08)
+
+# Colour the background:
+cols <- TernaryPointValues(rgb)
+ColourTernary(cols, spectrum = NULL)
+
+# Show taxa in simplex
+# Add data points
+data_points <- lapply(1:dim(fct_coords)[1],function(i) as.vector(fct_coords[i,]))
+names(data_points) <- as.character(tnames)
+
+AddToTernary(points, data_points, pch=20, cex=2, 
+             bg=vapply(data_points, 
+                       function (x) rgb(x[1], x[2], x[3], 128, maxColorValue=255),
+                       character(1))
+             )
+AddToTernary(text, data_points, names(data_points), cex=0.8, font=2)
+
+# Convert simplex coordinates to colors
+simplex2color <- function(x){
+  x=as.vector(x*255)
+  return(rgb(x[1], x[2], x[3], 128, maxColorValue=255))
+}
+
+taxcolors=apply(fct_coords,1,simplex2color)
+names(taxcolors)=as.character(tnames)
+```
+
+
+-----------------
+ Helper function
+-----------------
+function(v,vt,sel_taxa,dis,ndis,tcolors,torder) => plots of SHAP values along gradient (num/ordi) modalities (cat/bin) of v; such that ylabels=taxa are ordered according to dendrogram obtained from provided distance matrix (functional group distance, phylo distance, trait distance). Taxa labels colors can also be colored given tcolors. 
+
+tcolors => FG_simplex / prevalence / specific trait values / species / genus
+order => argument used if dis is None; if provided it gives an order of taxa (ex: order by decreasing prevalence, order by biomass, etc.) 
+
+SHAP based clustering
+
+```{r}
+library(cluster); library(ggdendro); library(ggplot2);library(viridis)
+get_dendro<-function(hc,titre=''){
+  ##set order of taxa according to hierarchical clustering
+  txorder=hc$order
+  
+  ##Setup colors
+  tcolors=as.character(taxcolors[codes[txorder]])
+  
+  ##Prepare dendrogram data
+  dendrf    <- dendro_data(hc, type="rectangle") # convert for ggplot
+  clust.dff <- data.frame(label=codes) 
+  dendrf[["labels"]]   <- merge(dendrf[["labels"]],clust.dff, by="label")
+  
+  ##Dendrogram plot
+  g1<- ggplot() + 
+    geom_segment(data=segment(dendrf), aes(x=x, y=y, xend=xend, yend=yend)) +
+    geom_text(data=label(dendrf), aes(x, y, label= label, hjust=0.01 ,color=label
+                                      ),size=6) +
+    coord_flip() +
+    scale_y_reverse(expand=c(1, 1)) + 
+    theme_dendro() +
+    scale_color_manual(values=taxcolors)+
+    theme(legend.position="none",
+          panel.background = element_rect(fill = "transparent"), # bg of the panel
+          plot.background = element_rect(fill = "transparent", color = NA),
+          plot.title = element_text(family = "sans",face='bold', hjust=0.5,vjust=1,size = 20, margin=margin(0,0,5,0))) +
+    ggtitle(titre)
+  
+  return(list(tcolors=tcolors,txorder=txorder,g1=g1))
+}
+
+## Routine to plot SHAP summary
+shap_summary<-function(v,vt,shap_global=shap_global,txorder=seq(1,77),sel_taxa=codes,titre='',lpos='right',tcols=taxcolors,
+                       scale=1,colours=NULL,shapes=NULL,filt=c('NS')){
+  ##subset relevant shapley values
+  vn=lvars[[v]]
+  subdata=subset(shap_global,feature==v & taxa %in% sel_taxa)
+  
+  subdata$taxa=factor(subdata$taxa, levels = as.character(sel_taxa)[txorder])
+  
+  ##encode categories
+  if(vt=='numerical'){
+    subdata$xval=subdata$xval/scale
+
+    g2=ggplot(subdata,aes(y=taxa,x=phi,col=xval))+
+      geom_jitter()+
+      labs(fill=vn,col=vn)+
+      ylab(NULL)+xlab(NULL)+
+      scale_y_discrete(position = "left")+
+      theme(legend.position = lpos,axis.text.y = element_text(size=16,colour = tcols),
+            axis.text.x = element_text(size=16),
+            legend.key.size = unit(3,"line"),legend.text = element_text(size=14),
+            legend.title = element_text(size=16),
+            plot.title = element_text(family = "sans",face='bold', 
+                                      hjust=0.5,size = 20, margin=margin(0,0,5,0)))+
+      ggtitle(titre)+
+      scale_color_viridis_c(option='magma')
+  
+  }else{
+    subdata$xvalc=factor(as.character(scale[as.character(subdata$xval)]),levels = as.character(scale))
+    
+    g2=ggplot(subset(subdata,!(xvalc %in% c(filt,NA))),aes(y=taxa,x=phi,col=xvalc))
+    if(!is.null(shapes)) g2=g2+geom_jitter(aes(shape=xvalc,size=5))+
+      scale_shape_manual(values=shapes) else g2=g2+geom_jitter()
+      
+    g2=g2+labs(fill=vn,col=vn)+
+      ylab(NULL)+xlab(NULL)+
+      scale_y_discrete(position = "left")+
+      theme(legend.position = lpos,axis.text.y = element_text(size=16,colour = tcols),
+            axis.text.x = element_text(size=16),
+            legend.key.size = unit(10,"pt"),legend.text = element_text(size=14),
+            legend.title = element_text(size=16),
+            plot.title = element_text(family = "sans",face='bold', hjust=0.5,
+                                      size = 20, margin=margin(0,0,5,0)))+
+      ggtitle(titre)
+    
+    if(is.null(colours)) g2=g2+scale_color_viridis_d(option='magma') else g2=g2+scale_color_manual(values=colours)
+  }
+  
+  return(g2)
+}
+```
+
+
+******************
+Numerical SHAP
+******************
+
+```{r, fig.height=15, fig.width=30}
+### Numerical features
+hcaf=hclust(dist(sp_emb))
+prep<-get_dendro(hcaf,'Response groups')
+g2<-shap_summary(v='pH',vt = 'numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='pH_eau',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+g3<-shap_summary(v='awc_top',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='AWC Topsoil',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g4<-shap_summary(v='bio_13',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='Precipitation of Wettest Month',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g5<-shap_summary(v='bio_7',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='Annual temperature range',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+
+#pdf('paper/final_figures/shap_past_c.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(prep$g1,g2,g3,g4,g5,ncol=5)
+#dev.off()
+```
+
+```{r}
+pdf('paper/final_figures/response_shape/taxa2numenv.pdf',height=15,width=10)
+for(v in num_vars){
+  gv<-shap_summary(v=v,vt = 'numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre=as.character(unlist(lvars)[v]),scale=1,lpos = 'bottom',tcols = prep$tcolors)
+  gridExtra::grid.arrange(prep$g1,gv,ncol=2)
+}
+dev.off()
+```
+
+******************
+Discrete SHAP
+******************
+
+Setup WR esthetics
+```{r,fig.height=15}  
+wrscales=cat_names$wr[[1]]
+names(wrscales)=cat_names$wr[[2]]
+
+wrcolours=c('red','snow3','cadetblue3','blue','black')
+
+names(wrcolours)=cat_names$wr[[1]]
+```
+
+Setup crusting esthetics
+```{r,fig.height=15}  
+crusscales=cat_names$crusting[[1]]
+names(crusscales)=cat_names$crusting[[2]]
+```
+
+Setup land cover esthetics
+```{r,fig.height=20,fig.width=20}  
+clcscales=cat_names$clc[[1]]
+names(clcscales)=cat_names$clc[[2]]
+
+clccolours=c('black','black','black','black',
+             'springgreen4','tomato','orange','yellow',
+             'brown','khaki','grey',
+             'blue','midnightblue',
+             'darkblue','darkblue',
+             'white'
+             )
+
+names(clccolours)=cat_names$clc[[1]]
+```
+
+Setup erodi esthetics
+```{r,fig.height=20,fig.width=20}  
+erodiscales=cat_names$erodi[[1]]
+names(clcscales)=cat_names$erodi[[2]]
+
+erodicolours=c('white','beige','pink','magenta','violet','black'
+             )
+
+names(erodicolours)=cat_names$erodi[[1]]
+```
+
+```{r}
+prep<-get_dendro(hcaf)
+g7 <- shap_summary(v='wr',vt='categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Water regime',scale=wrscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = wrcolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g8 <- shap_summary('crusting','categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Soil crusting',scale=crusscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = NULL,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g9 <- shap_summary(v='clc',vt = 'categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Land Cover Class',scale=clcscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+hcphylo=hclust(as.dist(pdis))
+#plot(hcphylo)
+prepphyl=get_dendro(hcphylo,titre = 'Phylogeny')
+g9p <- shap_summary(v='clc',vt = 'categorical',shap_global = shap_global,txorder = prepphyl$txorder,
+                   titre='Land Cover Class',scale=clcscales,lpos='right',tcols = prepphyl$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+
+pdf('paper/final_figures/clcshapphyl.pdf',width = 20,height = 15)
+#gridExtra::grid.arrange(prep$g1,g9,ncol=2)
+gridExtra::grid.arrange(prepphyl$g1,g9p,ncol=2)
+dev.off()
+
+ggsave('paper/final_figures/respclc.pdf',g9p,width = 10,height = 15)
+ggsave('paper/final_figures/phyl.png',prepphyl$g1,width = 10,height = 15)
+
+
+```
+
+```{r}
+o=dcast(subset(shap_glob_trait,group=='precipitation'),site+fname~taxa,value.var = 'phi')
+df=o[,codes]
+kclust=kmeans(t(df),5)
+fviz_cluster(
+  kclust,
+  data = t(df),
+  ellipse.type = 'norm'
+)
+```
+
+
+### Precipitation dendrogram
+
+```{r, fig.width=15,fig.height=15}
+dis_prec=gdisdf$precipitation
+colnames(dis_prec)=rownames(dis_prec)=codes
+hc.prec=get_dendro(hclust(dist(dis_prec)))
+
+unlist(lvars)
+gpseas<-shap_summary(v='bio_15',vt='numerical',shap_global = shap_global,txorder = hc.prec$txorder,
+                 titre='Precipitation seasonality',scale=10,lpos = 'bottom',tcols = hc.prec$tcolors)
+
+gridExtra::grid.arrange(hc.prec$g1,gpseas,ncol=2)
+
+gpwetm<-shap_summary(v='bio_13',vt='numerical',shap_global = shap_global,txorder = hc.prec$txorder,
+                 titre='Precipitation of wettest month',scale=10,lpos = 'bottom',tcols = hc.prec$tcolors)
+
+gpcoldq<-shap_summary(v='bio_19',vt='numerical',shap_global = shap_global,txorder = hc.prec$txorder,
+                 titre='Precipitation of coldest quarter',scale=10,lpos = 'bottom',tcols = hc.prec$tcolors)
+
+gpwarmq<-shap_summary(v='bio_18',vt='numerical',shap_global = shap_global,txorder = hc.prec$txorder,
+                 titre='Precipitationof warmest quarter',scale=10,lpos = 'bottom',tcols = hc.prec$tcolors)
+
+gptoty<-shap_summary(v='bio_12',vt='numerical',shap_global = shap_global,txorder = hc.prec$txorder,
+                 titre='Total precipitation',scale=10,lpos = 'bottom',tcols = hc.prec$tcolors)
+
+gridExtra::grid.arrange(hc.prec$g1,gpseas,gptoty,ncol=3)
+
+pdf('paper/final_figures/response_groups/precipitation/precdetailed.pdf',width = 20,height = 15)
+gridExtra::grid.arrange(hc.prec$g1,gpseas,gpwetm,gpcoldq,gpwarmq,ncol=5)
+dev.off()
+
+
+fviz_cluster(hcut(dis_prec,4),data=)
+```
+
+
+*****************************************************************************************************************
+                                              SHAP TEST MANTEL PHYLOGENY/FCT
+*****************************************************************************************************************
+
+
+Answer: Is there a structure related to taxo/traits/fg/phylo in earthworms' response to env variables ? what variables ?
+Statistical analysis on SHAPLEY values
+
+
+1) Distance-based analysis
+
+- Compute distance of response (SHAP) for each variable
+- Perform Mantel test of distance between responses and phylo/fct distances
+```{r}
+vdisdf=lapply(names(lvars), function(v){
+  vphi=dcast(subset(shap_global,feature==v & taxa %in% subtaxa_names),site~class,value.var = 'phi')
+  m=length(subtaxa_names)
+  dphi=(1-cosine_similarity(t(vphi[,2:(1+m)])))
+  return(dphi)
+  })
+
+names(vdisdf)=unlist(lvars)[names(lvars)]
+
+# vdatadf=lapply(names(lvars), function(v){
+#   vphi=dcast(subset(shap_global,feature==v & taxa %in% subtaxa_names),site~class,value.var = 'phi')
+#   #m=length(subtaxa_names)
+#   #dphi=(1-cosine_similarity(t(vphi[,2:(1+m)])))
+#   return(vphi)
+#   })
+
+names(vdatadf)=unlist(lvars)[names(lvars)]
+
+gdisdf=lapply(c('temperature','precipitation','hydro','physchem','landcover','structural'), 
+  function(f){
+      varis=unlist(lvars)[rownames(vargroups)[which(vargroups$group==f)]]
+      df=matrix(0,ncol=m,nrow=m)
+      for(v in as.character(varis)) 
+        df=df+vdisdf[[v]]
+      
+      return(df)
+  })
+
+names(gdisdf)=c('temperature','precipitation','hydro','physchem','landcover','structural')
+gdisdf$respemb=dist(sp_emb)
+
+colnames(tdis)=rownames(tdis)=as.character(tnames)
+names(vdisdf)=as.character(unlist(lvars))
+fdis_=fdis[subtaxa_names,subtaxa_names]
+tdis_=tdis[subtaxa_names,subtaxa_names]
+pdis_=pdis
+
+edis=dist(sp_emb)
+
+```
+
+Visualization
+```{r}
+ed=cosine_similarity(sp_emb)
+colnames(ed)=rownames(ed)=rownames(sp_emb)
+elong=melt(as.matrix(ed))
+plong=melt(pdis_)
+flong=melt(fdis_)
+tlong=melt(tdis_)
+
+pairdist=cbind(elong[,1:2],niche=elong$value,phylogenetic=plong$value,ecological=flong$value,functional=tlong$value)
+
+ggplot(pairdist,aes(x=log(phylogenetic),
+                    y=functional,col=niche))+
+  geom_point()+
+  scale_color_gradient2(low='blue',mid='white',high='red')
+
+```
+
+
+Mantel tests
+Non are significant
+```{r}
+library(ecodist)
+do_test=F
+
+if(do_test){
+mantel_test<-function(dresp,v){
+  testfg=ecodist::mantel(as.dist(dresp) ~ as.dist(fdis_) + as.dist(tdis_) + as.dist(pdis_),mrank = T)
+  testtrait=ecodist::mantel(as.dist(dresp) ~ as.dist(tdis_) + as.dist(fdis_) + as.dist(pdis_),mrank = T)
+  testphylo=ecodist::mantel(as.dist(dresp) ~ as.dist(pdis_) + as.dist(tdis_) + as.dist(fdis_),mrank = T)
+  
+  res=data.frame(rbind(testfg,testtrait,testphylo))
+  colnames(res)=c('mantelr', 'r<=0', 'r>=0', 'r=0','llim.2.5%','ulim.97.5%')
+  res$var=v
+  res$test=c('FG','TR','PH')
+  rownames(res)=NULL
+  
+  return(res)
+}
+
+dist_cor=rbind(do.call(rbind,lapply(names(vdisdf), function(v) mantel_test(vdisdf[[v]],v))),mantel_test(edis,'emb'))
+
+
+gdist_cor=do.call(rbind,lapply(names(gdisdf), function(g) mantel_test(gdisdf[[g]],g)))
+
+write.csv(dist_cor,'paper/interp/Partialresponse/distance_correlation.csv')
+write.csv(gdist_cor,'paper/interp/Partialresponse/gdistance_correlation.csv')
+}else{
+  dist_cor=read.csv('paper/interp/Partialresponse/distance_correlation.csv')
+  gdist_cor=read.csv('paper/interp/Partialresponse/gdistance_correlation.csv')
+}
+```
+
+Report mantel test results
+```{r}
+df=reshape2::dcast(dist_cor[,c('test','var','mantelr')],var ~ test,fill = 'mantelr')
+rownames(df)=df$var
+df$var=NULL
+
+data=apply(df,2,as.numeric)
+rownames(data)=rownames(df)
+
+dist_cor$signif=sapply(apply(dist_cor[,c('r=0','r<=0','r>=0')],1,min),function(x) 
+  ifelse(x<0.001,'**',ifelse(x<0.01,'*','')))
+
+ggplot(dist_cor,aes(y=test,x=var,fill=mantelr,label=signif))+
+  geom_tile(color = "white")+
+  geom_text(color="black",size=4,angle=90)+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab",
+   name="Correlation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 90,size = 9,hjust = 0, vjust = 0),
+    legend.position = 'bottom')+
+  coord_fixed()+
+  xlab('Environmental features')+ylab('Distance')
+
+
+gdist_cor$signif=sapply(apply(gdist_cor[,c('r=0','r<=0','r>=0')],1,min),function(x) 
+  ifelse(x<0.005,'**',ifelse(x<0.05,'*','')))
+
+gdist_cor$var=factor(gdist_cor$var,levels=
+                       c('temperature','precipitation','landcover','hydro','physchem','structural','respemb'))
+
+ggplot(gdist_cor,aes(y=test,x=var,fill=mantelr,label=signif))+
+  geom_tile(color = "white")+
+  geom_text(color="black",size=8)+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab",
+   name="Correlation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 90,size = 9,hjust = 0, vjust = 0),
+    legend.position = 'bottom')+
+  coord_fixed()+
+  xlab('Feature group')+ylab('Distance')+
+  ggtitle('Correlation of response dissimilarity and taxa distances')
+```
+
+
+2) Visualize correlations
+```{r,fig.height=15}
+library(Hmisc)
+viz=F
+if(viz){
+vcordf=lapply(names(lvars), function(v,txord=NULL){
+  vphi=dcast(subset(shap_global,feature==v & taxa %in% subtaxa_names),site~class,value.var = 'phi')
+  m=length(subtaxa_names)
+  
+  dat=vphi[,2:(1+m)]
+  
+  cphi=cor(dat,method = 'spearman')
+  rownames(cphi)=colnames(cphi)=subtaxa_names
+  
+  cor_5 <- rcorr(as.matrix(dat))
+  M <- cor_5$r
+  p_mat <- cor_5$P
+  
+  if(is.null(txord)){
+    meth='hclust'
+    txord=corrplot::corrMatOrder(cphi,meth)
+  }else{
+    meth='original'
+  }
+  
+  ordcols=as.character(taxcolors[subtaxa_names])[txord]
+  
+  corrplot::corrplot(cphi,type='lower',order = meth,tl.col = ordcols,
+                     sig.level = 0.001,p.mat = p_mat,insig = "blank",
+                     mar=c(0,0,1,0),
+                     tl.srt = 45,title=as.character(lvars[[v]]))
+  
+  
+  return(cphi)
+  })
+}
+```
+
+*****************************************************************************************************************
+                                        OPTIMAL CONDITIONS PER TAXA
+*****************************************************************************************************************
+```{r}
+library(soiltexture)
+
+opt=lapply(num_vars,function(f){
+  l=lapply(codes,function(tax){
+    obstax=env_raw[as.character(subset(obs_geo_full,tname==tax)$Id_station),]
+    c(median(obstax[,f]),mean(obstax[,f]),sd(obstax[,f]))
+  })
+  names(l)=codes
+  return(data.frame(l,row.names = c('median','mean','sd')))
+})
+
+names(opt)=unlist(num_names)[num_vars]
+
+opt_df=data.frame(t(do.call(rbind,opt)))
+opt_df$sand.median=100-(opt_df$clay.median+opt_df$silt.median)
+
+tri.data = opt_df[,c('clay.median','silt.median','sand.median')]
+colnames(tri.data)=c('CLAY','SILT','SAND')
+
+opt_df$texture.median=soiltexture::TT.points.in.classes(tri.data ,class.sys = 'FR.GEPPA.TT',PiC.type = 't')
+
+geo=soiltexture::TT.plot(class.sys='FR.GEPPA.TT',class.p.bg.col = TRUE,tri.data = tri.data)
+TT.text(tri.data = tri.data,geo=geo,labels = rownames(tri.data),cex = 1,blr.tx = T)
+
+o=opt_df[,c('pH.median','CN.median','C.median')]
+o$taxa=rownames(o)
+
+ggplot(o,aes(x=pH.median,y=C.median,label=taxa,col=taxa))+
+  geom_point()+
+  scale_x_reverse()+
+  geom_text(check_overlap = T)+
+  scale_color_manual(values=taxcolors)+
+  theme(legend.position = 'none')+
+  ggtitle('pH and Carbone preferences')
+
+ggplot(o,aes(x=pH.median,y=CN.median,label=taxa,col=taxa))+
+  geom_point()+
+  scale_x_reverse()+
+  geom_text(check_overlap = T)+
+  scale_color_manual(values=taxcolors)+
+  theme(legend.position = 'none')+
+  ggtitle('pH and CN preferences')
+
+
+```
+
+Report table of optimal values
+```{r}
+optim_hab=read.csv('paper/final_figures/optimal_habitat.csv')
+varis=as.character(unlist(lvars))
+
+write.csv(optim_hab,'optimal_hs_taxa.csv')
+
+```
+
+
+*****************************************************************************************************************
+                                      SHAP DEPENDENCE PLOT OF COMMUNITY INDICATORS
+*****************************************************************************************************************
+
+### Add traits to SHAP_GLOBAL
+```{r}
+rownames(traits_df)=NULL
+traits_df=cbind(traits_df,fct_coords)
+traits_df$taxa=1:dim(traits_df)[1]
+shap_glob_trait=merge(shap_global,traits_df,by.x = 'class',by.y = 'taxa')
+for(c in names(trait_encoding)){
+  vals=trait_encoding[[c]]$names
+  names(vals)=trait_encoding[[c]]$codes
+  shap_glob_trait[[c]]=as.character(vals[shap_glob_trait[[c]]])
+  
+  shap_glob_trait[[c]]=factor(shap_glob_trait[[c]],levels=unique(vals))
+}
+
+```
+
+```{r}
+
+vals=c('lamelated','lamelated','lamelated_pinnated','massive','pinnated','reduced','pinnated')
+names(vals)=c('multilamelated','bilamelated','lamelated_pinnated','massive','pinnated','reduced','pinnated_cylindrical')
+
+shap_glob_trait$Typhlosole_type=vals[shap_glob_trait$Typhlosole_type]
+
+library(ggpubr)
+ggplot(subset(shap_glob_trait,fname=='CN'),aes(x=xval,y=phi,col=Typhlosole_type))+
+  geom_smooth(method='lm')+
+  xlab('Carbone to Nitrogen ratio')+ylab('Response')
+
+ggplot(subset(shap_glob_trait,fname=='C'),aes(x=xval,y=phi,col=Typhlosole_type))+
+  geom_smooth(method = 'lm')+
+  #stat_regline_equation()+
+  #stat_cor()+
+  #geom_jitter()+
+  xlab('Carbone (mg/Kg of soil)')+ylab('Response (SHAP value)')
+
+ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=phi,col=Morren_gland_diverticule_type))+
+  geom_smooth(method = 'lm')+
+  #stat_regline_equation()+
+  stat_cor()+
+  #geom_jitter()+
+  xlab('pH')+ylab('Response')
+
+ggplot(subset(shap_glob_trait,fname=='cec_top'),aes(x=xval,y=phi,col=Typhlosole_type))+
+  geom_smooth(method='lm')+
+  xlab('Cation exchange capacity')+ylab('Response')
+
+ggplot(subset(shap_glob_trait,fname=='bs_top'),aes(x=xval,y=phi,col=Typhlosole_type))+
+  geom_smooth(method='lm')+
+  xlab('Base saturation')+ylab('Response')
+
+# -lamellé
+# -lamellé-penné
+# -penné
+# -massif
+# -réduit 
+
+
+# ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=Morren_gland_extension,col=phi))+
+#   geom_point()+
+#   scale_color_gradient2(low='blue',high='red')+
+#   #geom_smooth(method='lm')+
+#   xlab('Acidity level (pH)')+ylab('Response')
+```
+
+
+Summarize response of different trait classes to environmental gradients
+```{r}
+results=list()
+for (tr in cat_traits){
+  for (tv in trait_encoding[[tr]]$names){
+    for (xv in num_vars){
+        subdf=shap_glob_trait[which(shap_glob_trait[,tr]==tv),]
+        if(dim(subdf)[1]>0){
+          stat=cor.test(subdf$phi,scale(subdf$xval),method = 'spearman')
+          res=c(xv,tr,tv,as.numeric(stat$estimate),stat$p.value,stat$alternative)
+          names(res)=c('feature','trait','class','cor','pvalue','alt')
+          results=append(results,data.frame(res))
+        }
+    }
+  }
+}
+```
+Viz
+```{r}
+df=data.frame(do.call(rbind,results))
+colnames(df)=c('feature','trait','class','cor','pvalue','alt')
+write.csv(df,'paper/final_figures/response_shape/spearman_traits_shap.csv')
+saveRDS(shap_glob_trait,'shaptraitdump.rds')
+```
+
+Linear mixed effect model 
+SHAP_PHI ~ 1 + X | Trait_category 
+
+```{r}
+library(lme4)
+library(sjPlot) #for plotting lmer and glmer mods
+library(sjmisc) 
+library(effects)
+library(sjstats) #use for r2 functions
+library(purrr)
+
+summary_model<-function(data,xv,tr){
+  data$tr=data[,tr]
+  
+  p=ggplot(data,aes(x=xval,y=phi,col=tr))+
+    geom_smooth(method = 'lm',level=0.9)+
+    xlab(xv)+ylab('Response (SHAP)')+
+    scale_color_discrete(name=tr)+
+    geom_rug()
+  
+  fits <- lmList(phi ~ xvaln | tr, data=data)
+  return(list(lms=fits,plot=p))
+}
+
+results=data.frame(matrix(nrow=0,ncol=6))
+colnames(results)=c('intercept','slope','pvalue','feature','trait','tvalue')
+for (xv in num_vars){
+    for (tr in cat_traits){
+        data=subset(shap_glob_trait, feature==xv)
+        mu=mean(data$xval)
+        stdv=sd(data$xval)
+        data$xvaln=scale(data$xval)
+        
+        summ=summary_model(data,xv,tr)
+        plot(summ$plot)
+        
+        coef=data.frame(coefficients(summ$lms))
+        pvals <- lapply(summ$lms, function(mod) {
+                stat <- summary(mod)$fstatistic
+                pf(stat[1], stat[2], stat[3], lower=F)
+              })
+        
+        colnames(coef)=c('intercept','slope')
+        coef$pvalue=unlist(pvals)
+        coef$feature=xv
+        coef$trait=tr 
+        coef$tvalue=names(summ$lms)
+        
+        results=rbind(results,coef)
+    }
+}
+
+rownames(results)=NULL
+results$fname=unlist(lvars)[results$feature]
+```
+
+```{r, fig.height=12, fig.width=10}
+### 
+results$sl=results$slope*(results$pvalue<0.001)*1
+ggplot(results)+
+  geom_tile(aes(x = fname , fill = sl,y=tvalue))+
+  scale_fill_gradient2(midpoint=0,  low="blue", mid="white", high="red" , space = "Lab")+
+  facet_wrap(~trait,scales='free_y',ncol=1)+
+  theme(axis.text.x = element_text(angle = 90,vjust = 0), axis.text = element_text(size=12) )+
+  xlab('Feature')+
+  ylab('Slope')
+```
+Linear model numerical traits modulating the response of ew to abiotic gradients
+```{r}
+library(lme4)
+library(sjPlot) #for plotting lmer and glmer mods
+library(sjmisc) 
+library(effects)
+library(sjstats) #use for r2 functions
+library(purrr)
+
+modul_model<-function(data,xv){
+  
+  ### Fit
+  #data[,num_traits]=apply(data[,num_traits],2,scale)
+  mod <- lm(phi ~ 
+              xval*(Max_length + Max_diameter + Max_weight + 
+                       Clitellum_extension + Puberculum_extension + Morren_gland_extension + Oesophagian_gizzard_extension),
+            data=data)
+  
+  fstat <- summary(mod)
+  fits=data.frame(fstat$coefficients)
+  fits$coef=rownames(fits)
+  fits$feature=xv
+  rownames(fits)=NULL
+  
+  return(list(model=mod,lms=fits,plot=p))
+}
+
+library(jtools)
+library(kableExtra)
+#pdf('env_trait_mod.pdf')
+results=data.frame(matrix(nrow=0,ncol=6))
+
+shap_glob_trait$wlratio=shap_glob_trait$Max_weight/shap_glob_trait$Max_length
+
+for (xv in num_vars){
+    data=subset(shap_glob_trait, feature==xv)
+    #mu=mean(data$xval)
+    #stdv=sd(data$xval)
+    #data$xvaln=scale(data$xval)
+    
+    estim=modul_model(data,xv)
+    summ(estim$model,robust = "HC1",scale=T,center=T,transform.response = TRUE,confint=T,
+         vifs=T)
+    
+    #plot_summs(estim$model, scale = TRUE, inner_ci_level = .9,plot.distributions = TRUE)+ggtitle(xv)
+    p=plot_summs(estim$model, scale = TRUE, inner_ci_level = .9)+ggtitle(xv)
+    print(p)
+    
+    for(tr in c("Max_length","Max_diameter","Max_weight","wlratio",
+                "Clitellum_extension","Puberculum_extension","Morren_gland_extension","Oesophagian_gizzard_extension")){
+      
+      g=ggplot(data,aes(x=xval,y=phi,col=get(tr)))+
+              geom_point()+
+              scale_color_viridis()+
+              xlab(unlist(lvars)[xv])+ylab('phi')+ggtitle(tr)
+      
+      plot(g)
+      
+    }
+    
+    results=rbind(results,estim$lms)
+}
+
+#dev.off()
+
+rownames(results)=NULL
+results$fname=unlist(lvars)[results$feature]
+#write.csv(results,'modul_trait.csv')
+
+```
+
+```{r}
+
+mgdtcode=trait_encoding$Morren_gland_diverticule_type$names
+names(mgdtcode)=trait_encoding$Morren_gland_diverticule_type$codes
+data=data.frame(cbind(y=as.numeric(opt_df$pH.median),x=as.numeric(traits_df$Morren_gland_diverticule_type),label=codes))
+data$x=mgdtcode[as.character(data$x)]
+ggplot(data,aes(x=as.factor(x),y=y,label=label))+
+  geom_point()+
+  geom_text()
+
+trait_encoding$Morren_gland_diverticule_type
+
+
+ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=phi,col=Morren_gland_diverticule_type))+
+  geom_point()+
+  geom_smooth(method='lm')
+  
+
+ggplot(data.frame(Morren_gland_diverticule_type=traits_df$Morren_gland_diverticule_type),
+       aes(x=Morren_gland_diverticule_type))+
+  geom_bar(stat='count')
+
+
+ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=phi,col=Morren_gland_extension))+
+  scale_color_viridis()+
+  geom_point(position = position_dodge(width=0.3))+
+  xlab('pH')+ylab('Response')
+
+
+ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=phi,group=Morren_gland_extension,col=Morren_gland_extension))+
+  scale_color_viridis()+
+  geom_smooth(method='lm')+
+  geom_point(position = position_dodge(width=1))+
+  xlab('pH')+ylab('Response')
+
+
+ggplot(subset(shap_glob_trait,fname=='pH'),aes(x=xval,y=phi,group=taxa,col=Morren_gland_extension))+
+  scale_color_viridis()+
+  geom_smooth(method='lm')+
+  xlab('pH')+ylab('Response')
+
+mod <- lm(phi ~ xval+xval:Morren_gland_extension,
+          data=subset(shap_glob_trait,fname=='pH'))
+
+summ(mod,robust = "HC1",
+     scale=T,center=T,transform.response = TRUE,confint=T,vifs=T)
+
+plot_summs(mod, scale = TRUE, 
+           inner_ci_level = .9)+ggtitle('pH')
+```
+
+#### SHAP dependence plot (CLC, Texture Class)
+Xaxis = feature class
+Yaxis = SHAP
+Hue = FCT group color / Trait color 
+
+
+Numerical features
+```{r, fig.width=20, fig.height=30}
+library(gridExtra)
+library(RColorBrewer)
+##Numerical features
+pdf('paper/final_figures/fg_numX.pdf',width = 20,height = 30)
+ggplot(subset(shap_glob_trait,feature %in% num),aes(x=xval,y=phi,col=taxa))+
+  geom_point()+
+  scale_color_manual(values=taxcolors)+
+  facet_wrap(~fname,scales = 'free_x',ncol = 3)+
+    theme(legend.position = 'none',axis.text.x = element_text(angle = 45,size=16),
+            axis.text.y = element_text(size=16),
+            legend.key.size = unit(10,"pt"),legend.text = element_text(size=14),
+            legend.title = element_text(size=16))+
+  xlab('Environment')+ylab('SHAP')+ggtitle('Functional groups')
+dev.off()
+
+#pdf('paper/final_figures/trait_response.pdf')
+for(c in names(trait_encoding)){
+  print(
+  ggplot(subset(shap_glob_trait,feature %in% num),aes(x=xval,y=phi,col=get(c)))+
+    geom_smooth(method=lm,se = T)+
+    scale_color_brewer(palette = "Set1")+
+    facet_wrap(~fname,scales = 'free_x',ncol = 3)+
+    theme(legend.position = 'right',axis.text.x = element_text(angle = 45,size=16),
+            axis.text.y = element_text(size=16),
+            legend.key.size = unit(10,"pt"),legend.text = element_text(size=14),
+            legend.title = element_text(size=16))+
+      xlab('Environment')+ylab('SHAP')+ggtitle(c) + 
+      guides(col=guide_legend(title=c,override.aes = list(size=5)))
+    )
+}
+#dev.off()
+
+# for(c in num_traits){
+#   shap_glob_trait[[c]]=as.numeric(shap_glob_trait[[c]])
+#   print(
+#   ggplot(subset(shap_glob_trait,feature %in% num),aes(x=xval,y=phi,col=get(c)))+
+#     geom_point()+
+#     scale_color_viridis_c(direction=-1)+
+#     facet_wrap(~fname,scales = 'free_x',ncol = 3)+
+#     theme(legend.position = 'right',axis.text.x = element_text(angle = 45,size=16),
+#             axis.text.y = element_text(size=16),
+#             legend.key.size = unit(10,"pt"),legend.text = element_text(size=14),
+#             legend.title = element_text(size=16))+
+#       xlab('Environment')+ylab('SHAP')+ggtitle(c) + 
+#       guides(col=guide_legend(title=c,override.aes = list(size=5)))
+#   )
+# }
+```
+
+Categorical features
+```{r, fig.width=10, fig.height=10}
+library(lemon)
+##Categorical features
+all_cat=lapply(cat_vars, function(v){
+  #print(v)
+  subdata=subset(shap_glob_trait,feature==v)
+  ##encode
+  scales=cat_names[[v]][[1]]
+  names(scales)=cat_names[[v]][[2]]
+  subdata$xvalc=factor(as.character(scales[as.character(subdata$xval)]),levels = as.character(scales))
+
+  g<-ggplot(subdata,aes(x=xvalc,y=phi,col=taxa))+
+    geom_point()+
+    scale_color_manual(values=taxcolors)+
+    theme(legend.position = 'none',axis.text.x = element_text(angle = 45))+
+    xlab(lvars[[v]])+
+    ylab('SHAP')
+  
+  return(g)
+})
+do.call(grid.arrange,c(all_cat,top='Functional groups',ncol=3))
+
+for(c in names(trait_encoding)){
+  all_cat=lapply(cat_vars, function(v){
+  #print(v)
+  subdata=subset(shap_glob_trait,feature==v)
+  ##encode
+  scales=cat_names[[v]][[1]]
+  names(scales)=cat_names[[v]][[2]]
+  subdata$xvalc=factor(as.character(scales[as.character(subdata$xval)]),levels = as.character(scales))
+
+  g<-ggplot(subdata,aes(x=xvalc,y=phi,col=get(c)))+
+    geom_boxplot()+
+    scale_color_brewer(palette = "Dark2")+
+    #facet_wrap(~fname,scales = 'free_x',ncol = 3)+
+    theme(legend.position = 'none',axis.text.x = element_text(angle = 45,size=10),
+            axis.text.y = element_text(size=10),
+            legend.key.size = unit(10,"pt"),legend.text = element_text(size=10),
+            legend.title = element_text(size=10))+
+      xlab(lvars[[v]])+ylab('SHAP')+#ggtitle(c)+
+      guides(col=guide_legend(title=c,override.aes = list(size=3)))
+  g
+  return(g)
+})
+
+do.call(grid_arrange_shared_legend,c(all_cat,top=c,ncol=2,nrow=3))
+}
+
+# for(c in num_traits){
+#   shap_glob_trait[[c]]=as.numeric(shap_glob_trait[[c]])
+#   all_cat=lapply(cat_vars, function(v){
+#   #print(v)
+#   subdata=subset(shap_glob_trait,feature==v)
+#   ##encode
+#   scales=cat_names[[v]][[1]]
+#   names(scales)=cat_names[[v]][[2]]
+#   subdata$xvalc=factor(as.character(scales[as.character(subdata$xval)]),levels = as.character(scales))
+# 
+#   g<-ggplot(subdata,aes(x=xvalc,y=phi,col=get(c)))+
+#     geom_point()+
+#     scale_color_viridis_c(direction=-1)+
+#     facet_wrap(~fname,scales = 'free_x',ncol = 3)+
+#     theme(legend.position = 'none',axis.text.x = element_text(angle = 45,size=16),
+#             axis.text.y = element_text(size=16),
+#             legend.key.size = unit(10,"pt"),legend.text = element_text(size=14),
+#             legend.title = element_text(size=16))+
+#       xlab(lvars[[v]])+ylab('SHAP')+ggtitle(c) + 
+#       guides(col=guide_legend(title=c,override.aes = list(size=5)))
+#   return(g)
+# })
+# 
+# do.call(grid_arrange_shared_legend,c(all_cat,top=c,ncol=2,nrow=3))
+# }
+```
+
+*****************************************************************************************************************
+                                        Feature effect curves:  PDP + ICE
+*****************************************************************************************************************
+
+## 2-D  PDP/ICE
+pH vs CLC
+
+```{r}
+fg_predict=function(model,newdata){
+  community=hsm_norm_predict(model,newdata)
+  fg=compute_fct_composition(community)
+  return(fg)
+}
+predictor = Predictor$new(model = model, data=Xp, y = NULL, class=1:3,batch.size = nrow(X),
+                            predict.fun = fg_predict, type = NULL)
+
+
+fgpdp2d=function(v){
+  eff = FeatureEffect$new(predictor, feature = v, method = 'pdp', grid.size = 10)
+  
+  data=reshape2::dcast(data=eff$results,formula = get(v[1]) + get(v[2]) + .type ~ .class ,value.var = '.value')
+  colnames(data)=c('v1','v2',colnames(data)[3:6])
+  
+  fcols=apply(data[,c('p_epigeic','p_endogeic','p_anecic')],1,function(x) rgb(x[1],x[2],x[3]))
+  names(fcols)=data$id=1:dim(data)[1]
+  #data$clc=clccodes[data$clc]
+  g=ggplot(data,aes(x=v1,y=v2,fill=as.factor(id),col=as.factor(id)))+
+    geom_point(size=5)+
+    geom_tile()+
+    geom_rug()+
+    scale_color_manual(values=fcols)+
+    scale_fill_manual(values = fcols)+
+    theme(legend.position = 'none')+
+    xlab(unlist(lvars)[(v[1])])+
+    ylab(unlist(lvars)[(v[2])])
+  
+  return(g)
+}
+
+fgpdp2d(c('pH','clc'))
+fgpdp2d(c('pH','awc_top'))
+fgpdp2d(c('pH','cec_top'))
+fgpdp2d(c('pH','bs_top'))
+
+fgpdp2d(c('bio_12','bio_15'))
+fgpdp2d(c('pH','wr'))
+fgpdp2d(c('clc','wr'))
+fgpdp2d(c('bio_1','bio_12.'))
+fgpdp2d(c('bio_4','bio_15'))
+fgpdp2d(c('bio_13','bio_3'))
+fgpdp2d(c('pH','silt'))
+fgpdp2d(c('pH','clay'))
+fgpdp2d(c('clay','silt'))
+fgpdp2d(c('pH','parmado'))
+
+```
+
+
+```{r}
+## List of taxa of interest
+t=as.numeric(which(colMeans(occur)<0.1 & colMeans(occur)>0.01))# & colMeans(occur)<0.3))
+#codes[t]
+predictor = Predictor$new(model = model, data=Xp, y = NULL, class=t,
+                          batch.size = nrow(X),predict.fun = hsm_norm_predict, type = NULL)
+
+
+eff = FeatureEffect$new(predictor, feature = c('pH','clc'), method = 'pdp', grid.size = 20)
+eff$results$.class=codes[eff$results$.class]
+
+eff$results$clc=clccodes[eff$results$clc]
+
+eff$plot()
+```
+
+```{r, fig.height=10, fig.width=5}
+## Pairs of variables with interaction to explore
+v=c('pH','CN')
+v=c('clay','silt')
+v=c('awc_top','cec_top')
+v=c('pd_top','silt')
+v=c('bio_1','bio_12')
+
+pdf('pdp2d.pdf')
+
+predictor = Predictor$new(model = model, data=Xp, y = NULL, class=t,
+                          batch.size = nrow(X),predict.fun = hsm_norm_predict, type = NULL)
+
+
+for(v in num_vars){
+  eff1 = FeatureEffect$new(predictor, feature = v, method = 'ale', grid.size = 20)
+  eff1$results$.class=codes[eff1$results$.class]
+  
+  p1=eff1$plot()+xlab(as.character(unlist(lvars)[v]))
+  plot(p1)
+}
+
+dev.off()
+
+####################
+##
+eff2 = FeatureEffect$new(predictor, feature = v[2], method = 'ale', grid.size = 20)
+eff2$results$.class=codes[eff2$results$.class]
+##
+eff12 = FeatureEffect$new(predictor, feature = v, method = 'pdp', grid.size = 20)
+eff12$results$.class=codes[eff12$results$.class]
+
+p1=eff1$plot()+xlab(as.character(unlist(lvars)[v[1]]))
+p2=eff2$plot()+xlab(as.character(unlist(lvars)[v[2]]))
+p3=eff12$plot()+scale_fill_viridis()+
+  xlab(as.character(unlist(lvars)[v[1]]))+
+  ylab(as.character(unlist(lvars)[v[2]]))
+
+plot(p1)
+plot(p2)
+plot(p3)
+
+#gridExtra::grid.arrange(p1,p2,p3,nrow=3)
+
+#dev.off()
+### Visualization
+#eff$results$clc=clccodes[eff$results$clc]
+#eff$plot()+scale_color_manual(values=clccolours)+ggtitle(codes[t])
+```
+
+```{r, fig.width=20,fig.height=20}
+predictor = Predictor$new(model = model, data=Xp, y = NULL, class=1:77,batch.size = nrow(X),
+                            predict.fun = hsm_norm_predict, type = NULL)
+
+eff = FeatureEffect$new(predictor, feature = c('clay','silt'), method = 'ale', grid.size = 50)
+
+eff$results$.class=codes[eff$results$.class]
+eff$plot()+scale_fill_viridis()
+```
+
+
+
+## Feature effect curves: PDP+ICE
+### Adaptation to our model
+```{r}
+rownames(traits_df)=as.character(tnames)
+X=env_raw[rownames(env_raw) %in% sel_stations,c(num_vars,cat_vars)]
+
+Xp=X
+for(c in cat_vars){
+  Xp[[c]]=factor(Xp[[c]],levels = cat_names[[c]][[2]])
+}
+
+Xp[is.na(Xp)] <- 0
+
+compute_effect <- function(t,v,pred_fun,meth='pdp',gs=30,comm=F){
+  predictor = Predictor$new(model = model, data=Xp, y = NULL, class=t,batch.size = nrow(X),
+                            predict.fun = pred_fun, type = NULL)
+  
+  eff = FeatureEffect$new(predictor, feature = v, method = meth, grid.size = gs)
+  eff$feature.type = as.character(ftypes[v])
+  
+  res=eff$results
+  colnames(res)=c('env','task','val','type')
+  
+  ### Transform into community data
+  data=dcast(res,env~task,value.var = 'val',fun.aggregate = mean)
+  community=data[,-1]
+  colnames(community)=as.character(tnames)
+  
+  if(comm){
+    community=as.matrix(community)
+    out=cbind(data,
+          compute_fct_composition(community),
+          div=compute_taxo_diversity(community,'shannon'),
+          compute_cwm(community)[,c(num_traits,cat_traits)]#,
+          #compute_fct_diversity(community[,subtaxa_names],pdis)
+          ) 
+  }else{
+    out=community
+  }
+  
+  ### Transform results 
+  return(out)
+}
+```
+
+
+Partial dependence plots
+```{r}
+cal_pdp=F
+
+if(cal_pdp){
+pdpv=lapply(num_vars, function(v){
+  print(v)
+  compute_effect(1:length(tnames),v,pred_fun=hsm_norm_predict,meth='pdp',gs=50,comm=T)
+})
+
+names(pdpv)=num_vars
+
+pdpvc=lapply(cat_vars, function(v){
+  print(v)
+  #X[,v]=as.factor(X[,v])
+  compute_effect(1:length(tnames),v,pred_fun=hsm_norm_predict,meth='pdp',gs=50,comm=T)
+})
+
+names(pdpvc)=cat_vars
+}
+pdp_all=readRDS('empirical/iml/pdp.rds')
+```
+
+Accumulated local effects
+```{r}
+cal_ale=F
+
+if(cal_ale){
+alev=lapply(num_vars, function(v){
+  compute_effect(t=1:length(tnames),v=v,pred_fun=hsm_norm_predict,meth='ale',gs=50,comm=F)
+})
+
+names(alev)=num_vars
+
+alevc=lapply(cat_vars, function(v){
+  compute_effect(t=1:length(tnames),v=v,pred_fun=hsm_norm_predict,meth='ale',gs=50,comm=F)
+})
+
+names(alevc)=cat_vars
+}
+```
+
+
+Plot all PDP curves for community level indicators
+```{r,fig.width=15}
+pdf('paper/final_figures/pdp_community.pdf')
+for(v in num_vars){
+  df=pdp_all$num[[v]]
+  subdata=subset(melt(df,id.vars = c('env')),!(variable %in% as.character(1:77)))
+  subdata$value=round(as.numeric(subdata$value),2)
+  print(ggplot(subdata,aes(x=env,y=round(value,2)))+
+    geom_smooth()+
+    facet_wrap(~variable,scales='free_y')+
+      xlab(lvars[[v]])+ggtitle(sprintf('Community response to %s' , lvars[[v]] ))+ylab('')
+  )
+}
+
+for(v in cat_vars){
+  subdata=subset(melt(df,id.vars = c('env')),!(variable %in% as.character(1:77)))
+  subdata$env=factor(subdata$env,levels=cat_names[[v]][[2]],labels=cat_names[[v]][[1]])
+  subdata$value=round(as.numeric(subdata$value),2)
+  print(ggplot(subdata,aes(x=env,y=round(value,2)))+
+    geom_bar(stat = 'identity')+
+    facet_wrap(~variable,scales='free_y')+
+      xlab(lvars[[v]])+ggtitle(sprintf('Community response to %s' , lvars[[v]] ))+ylab('')
+  )
+}
+dev.off()
+```
+
+<!-- ```{r} -->
+<!-- past_fg=cbind(X,compute_fct_composition(community=as.matrix(Y))) -->
+<!-- past_fg$fcolor=apply(past_fg[,c('p_epigeic','p_endogeic','p_anecic')],1,simplex2color) -->
+
+<!-- curr_fg=cbind(X_curr,compute_fct_composition(community=as.matrix(p_hs_disp))) -->
+<!-- curr_fg[is.na(curr_fg)]=0 -->
+<!-- curr_fg$fcolor=apply(curr_fg[,c('p_epigeic','p_endogeic','p_anecic')],1,simplex2color) -->
+
+<!-- ggplot(curr_fg)+ -->
+<!--   geom_point(aes(x=pH,y=CN,col=fcolor))+ -->
+<!--   scale_color_identity() -->
+
+<!-- ggplot(curr_fg,aes(x=pH,y=CN))+ -->
+<!--   geom_contour(aes(z=fcolor),stat='identity')+ -->
+<!--   scale_color_identity() -->
+<!-- ``` -->
+
+
+Plot all PDP curves for each taxa
+```{r,fig.width=15}
+pdp_all=readRDS('empirical/iml/pdp.rds')
+for(v in num_vars){
+subdata=subset(melt(pdp_all$num[[v]],id.vars = c('env')),(variable %in% as.character(1:77)))
+subdata$value=round(as.numeric(subdata$value),2)
+subdata$taxa=as.character(tnames)[subdata$variable]
+subdata$tid=as.character(ret_taxa[subdata$variable])
+subdata$species=as.character(species[subdata$tid])
+subdata$genus=as.character(genus[subdata$tid])
+
+print(ggplot(subdata,aes(x=env,y=round(value,2),col=genus))+
+  geom_smooth()+
+  facet_wrap(~species,scales='free_y')+
+    xlab(lvars[[v]])+ggtitle(sprintf('Taxa response to %s' , lvars[[v]] ))+ylab('')
+)
+}
+
+for(v in cat_vars){
+  subdata=subset(melt(pdp_all$cat[[v]],id.vars = c('env')),(variable %in% as.character(1:77)))
+  subdata$env=factor(subdata$env,levels=cat_names[[v]][[2]],labels=cat_names[[v]][[1]])
+  subdata$value=round(as.numeric(subdata$value),2)
+  subdata$taxa=as.character(tnames)[subdata$variable]
+  subdata$tid=as.character(ret_taxa[subdata$variable])
+  subdata$species=as.character(species[subdata$tid])
+  subdata$genus=as.character(genus[subdata$tid])
+  
+  print(ggplot(subdata,aes(x=env,y=round(value,2),col=genus,fill=genus))+
+    geom_bar(stat='identity')+
+    facet_wrap(~species,scales='free_y')+
+      xlab(lvars[[v]])+ggtitle(sprintf('Taxa response to %s' , lvars[[v]] ))+ylab('')
+  )
+}
+```
+
+
+**********************************************************************************************************************************
+                                        SHAP CURRENT CONDITIONS
+**********************************************************************************************************************************
+SHAP current
+```{r}
+#library(parallel)
+#cl <- makeCluster(detectCores())
+
+shap_row<-function(Xi){
+  shapley <- Shapley$new(predictor_curr, x.interest = Xi)
+  out <- shapley$results
+  return(out)
+}
+
+shap_curr=F
+if(shap_curr){
+  all_shapley<-lapply(l_X, shap_row)
+  saveRDS(all_shapley,file='empirical/iml/shap/shapley_current.rds')
+
+  shapcurrdf=do.call(rbind,all_shapley)
+  write.csv(shapcurrdf,file='empirical/iml/shap/shap_curr_df.csv')
+}
+```
+
+
+**************************************************************************************************************
+                                       LIMITING FACTORS
+**************************************************************************************************************
+
+/**********************************************************************/
+LIMITING FACTORS : what's the decisive feature at each location, for each taxa ? 
+
+Load precimputed shap values on 1km grid
+```{r}
+curr_env=read.csv('data/current/current_env_raw.csv')
+geoshap=do.call(rbind,lapply(1:floor(dim(curr_env)[1]/50), function(i) curr_env[i*50,c('X','Longitude','Latitude')]))
+shapcurr=do.call(rbind,readRDS('empirical/iml/shap/shapley_current.rds'))
+shapcurr$site=rep(1:dim(geoshap)[1],each=77*36)
+geoshap$site=1:dim(geoshap)[1]
+#shapcurrdf=cbind(shapcurr,geoshap)
+#rm(geoshap)
+shapcurr$fname=as.character(sapply(shapcurr$feature,function(c) lvars[[c]]))
+shapcurrdf=merge(shapcurr,geoshap,by='site')
+rm(shapcurr)
+```
+
+```{r, fig.height=5, fig.width=5}
+df2raster<-function(df,sel='selmin',titre=paste('Limiting',tax),pos='right',si=3){
+  ew_geo <- st_as_sf(df, coords = c('Longitude','Latitude')) %>%
+    st_set_crs(4326)
+  g=ggplot(ew_geo)+
+      geom_map(map=gbr_map, data=gbr_map,
+                       aes(x=long, y=lat, map_id=id),
+                       fill='#ffffff',
+                       col="#000000")+
+      xlab('Longitude')+ylab('Latitude')+
+      geom_point(data=df,aes(y=Latitude,x=Longitude,col=get(sel)),size=si)+
+      #geom_point(data=subset(obs_geo_full,tname==tax),aes(x=Longitude,y=Latitude),colour='yellow')
+      theme(legend.position = pos,legend.text = element_text(size=9))+
+      ggtitle(titre)
+  
+  g
+}
+# getmode <- function(v,na.rm=F) {
+#    uniqv <- unique(v)
+#    uniqv[which.max(tabulate(match(v, uniqv)))]
+# }
+# 
+# bgd <- getData("GADM", country="FR", level=0)
+# geodata=data.frame(x=longlim$Longitude,y=longlim$Latitude)
+# target=''
+# data=data.frame(selmin=as.integer(longlim$seltemp))
+# f=getmode
+# 
+# spdf2raster<-function(geodata,target,data,resolution=0.01,f=median,cx=1){
+#   ext <- extent(geodata)
+#   rst <- raster(ext,resolution=resolution)
+#   rstx <- rasterize(geodata, rst, data, fun=f)
+#   
+#   plot(bgd,main = target,cex.main=cx)
+#   plot(rstx,col=tempc,add=TRUE)
+# }
+```
+
+
+Limiting factors
+
+```{r, fig.width=8,fig.height=8}
+eps=1E-6
+varname_r=names(lvars)
+names(varname_r)=as.character(unlist(lvars))
+
+longlim=reshape2::dcast(data = shapcurrdf,
+                        formula = site + Longitude + Latitude + class ~ fname,value.var = 'phi')
+
+cols=colnames(longlim)[c(-1,-2,-3,-4)]
+
+#longlim$posshap=longlim$phi*(longlim$phi>eps)
+#longlim$negshap=longlim$phi*(longlim$phi<(-eps))
+data=longlim[,cols]*(longlim[,cols]>eps)
+longlim$selmax=cols[apply(data,1,which.max)]
+data=longlim[,cols]*(longlim[,cols]<(-eps))
+longlim$selmin=cols[apply(data,1,which.min)]
+
+longlim$taxa=codes[longlim$class]
+
+longlim$varmin=as.character(varname_r[longlim$selmin])
+longlim$vargroupmin=vargroups[longlim$varmin,]
+longlim$colormin=unlist(colors)[longlim$vargroupmin]
+
+longlim$varmax=as.character(varname_r[longlim$selmax])
+longlim$vargroupmax=vargroups[longlim$varmax,]
+longlim$colormax=unlist(colors)[longlim$vargroupmax]
+
+tempcols=cols[25:35]
+preccols=as.character(precvars)
+longlim$seltemp=tempcols[apply(longlim[,tempcols],1,function(x) which.max(abs(x)))]
+longlim$selprec=preccols[apply(longlim[,preccols],1,function(x) which.max(abs(x)))]
+
+fcolors=c('grey','blue','cyan4','darkgreen','darkred','chocolate')
+names(fcolors)=c("temperature" ,  "precipitation" ,"hydro"   ,      "physchem"   ,   "landcover"  ,   "structural")
+
+fc=as.character(fcolors[vargroups[as.character(varname_r[as.character(unlist(lvars))]),]])
+names(fc)=as.character(unlist(lvars))
+
+fc['occur']='yellow'
+
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+tempvars=unlist(lvars)[rownames(vargroups)[which(vargroups$group=='temperature')]]
+tempc=brewer.pal(length(tempvars),'Set3')
+names(tempc)=as.character(tempvars)
+
+precvars=unlist(lvars)[rownames(vargroups)[which(vargroups$group=='precipitation')]]
+precc=brewer.pal(length(precvars),'Set3')
+names(precc)=as.character(precvars)
+
+longlim$selmin=factor(longlim$selmin,levels = feat_order)
+longlim$selmax=factor(longlim$selmax,levels = feat_order)
+longlim$seltemp=factor(longlim$seltemp,levels = as.character(tempvars))
+longlim$selprec=factor(longlim$selprec,levels = as.character(precvars))
+
+#write.csv(longlim,'limitingfactors.csv')
+
+pdf('paper/final_figures/limfavtmpprec.pdf',width = 7 ,height = 5)
+#subtaxa=c('Alchlo','Apcali','Apicte','Aprose','Lucast','Lucent','Luterr','Occyan','Samama')
+for(tax in subtaxa_names){
+    df=subset(longlim,taxa==tax)
+    
+    g1 = df2raster(df,'selmin',titre = paste('Limiting ',tax),pos='bottom',si=2) + 
+      scale_color_manual(name='',#Feature',
+                         values = fc)
+                         
+    g2 = df2raster(df,'selmax',titre = paste('Favorable ',tax),pos='bottom',si=2)+ 
+      scale_color_manual(name='',#Feature',
+                         values = fc)
+    
+    g3 = df2raster(df,'seltemp',titre = paste('Temperature ',tax),pos='bottom',si=2) + 
+      scale_color_manual(name='',values=tempc)
+    
+    g4 = df2raster(df,'selprec',titre = paste('Precipitation ',tax),pos='bottom',si=2) + 
+      scale_color_manual(name='',values=precc)    
+    
+    lemon::grid_arrange_shared_legend(g1,g2,ncol=2)
+    #gridExtra::grid.arrange(g3,g4,ncol=2)
+    plot(g3)
+    plot(g4)
+    #plot(g3)
+}
+dev.off()
+
+### climate vars only
+# pdf('climlim.pdf',width=15,height=15)
+# ggplot(subset(longlim,taxa %in% subtaxa))+
+#       geom_map(map=gbr_map, data=gbr_map,
+#                        aes(x=long, y=lat, map_id=id),
+#                        fill='#ffffff',
+#                        col="#000000")+
+#       xlab('Longitude')+ylab('Latitude')+
+#       geom_point(aes(x=Longitude,y=Latitude,col=seltemp))+
+#       facet_wrap(~taxa,ncol=3)+
+#       scale_color_brewer(palette = 'Set3')+4785_içiçiçiçiçiçiçiçiçiçiçl
+#       #scale_color_manual(name='Top limiting feature',values = fc)+
+#       #geom_point(data=subset(obs_geo_full,tname==tax),aes(x=Longitude,y=Latitude),colour='yellow')
+#       theme(legend.position = "bottom",legend.text = element_text(size=9))+
+#       ggtitle(paste('Temperature influence',tax))
+# dev.off()
+
+```
+
+```{r}
+### Taxwise absolute value ###
+g=ggplot(longlim)+
+    geom_map(map=gbr_map, data=gbr_map,
+                     aes(x=long, y=lat, map_id=id),
+                     fill='#ffffff',
+                     col="#000000")+
+    xlab('Longitude')+ylab('Latitude')+
+    geom_point(aes(x=Longitude,y=Latitude,col=sel))+
+    facet_wrap(~taxa)+
+    scale_color_manual(name='Feature',values = fc)+
+    theme(legend.position = "bottom",legend.text = element_text(size=12))+
+    ggtitle('Limiting factors')
+  
+g = g+ guides(color = guide_legend(override.aes = list(size=5)))
+
+ggsave(plot=g,filename = 'limitfact.pdf',width = 20,height = 20)
+
+pdf('limitingfactors_zoom.pdf',width = 10,height = 5)
+for(tax in codes){
+  ### Add occurrences
+  suboccur=subset(obs_geo_full,tname==tax)[,c('Longitude','Latitude')]
+  suboccur$sel='occur'
+  subdata=rbind(subset(longlim,taxa==tax)[,c('Longitude','Latitude','sel')],suboccur)
+  subdata$col=fc[subdata$sel]
+  subdata$Longitude=as.numeric(subdata$Longitude)
+  subdata$Latitude=as.numeric(subdata$Latitude)
+  obs_geo_full$Longitude=as.numeric(obs_geo_full$Longitude)
+  obs_geo_full$Latitude=as.numeric(obs_geo_full$Latitude)
+  
+  ### Limits
+  latmin=min(suboccur$Latitude)
+  latmax=max(suboccur$Latitude)
+  lonmin=min(suboccur$Longitude)
+  lonmax=max(suboccur$Longitude)
+  
+  df=subset(subdata,Latitude<=latmax & Latitude>=latmin & Longitude<=lonmax & Longitude>=lonmin)
+  subgr=subset(gbr_map,lat<=latmax & lat>=latmin & long<=lonmax & long>=lonmin)
+  g1 = ggplot(df)+
+      geom_map(map=gbr_map, data=gbr_map,
+                       aes(x=long, y=lat, map_id=id),
+                       fill='#ffffff',
+                       col="#000000")+
+      xlab('Longitude')+ylab('Latitude')+
+      geom_point(aes(x=Longitude,y=Latitude,col=sel))+
+      scale_color_manual(name='Top feature',values = fc)+
+      #geom_point(data=subset(obs_geo_full,tname==tax),aes(x=Longitude,y=Latitude),colour='yellow')
+      theme(legend.position = "bottom",legend.text = element_text(size=9))+
+      ggtitle(paste('Limiting factors ',tax))#+ guides(color = guide_legend(override.aes = list(size=3)))
+  
+  g2 = ggplot(df)+
+      # geom_map(map=gbr_map, data=gbr_map,
+      #                  aes(x=long, y=lat, map_id=id),
+      #                  fill='#ffffff',
+      #                  col="#000000")+
+      xlab('Longitude')+ylab('Latitude')+
+      geom_point(aes(x=Longitude,y=Latitude,col=sel))+
+      scale_color_manual(name='Top feature',values = fc)+
+      #geom_point(data=subset(obs_geo_full,tname==tax),aes(x=Longitude,y=Latitude),colour='yellow')
+      theme(legend.position = "bottom",legend.text = element_text(size=9))+
+      ggtitle(paste('Limiting factors ',tax))
+  
+  #gridExtra::grid.arrange(g2,g1,ncol=2)
+  lemon::grid_arrange_shared_legend(g1,g2,ncol=2)
+}
+dev.off()
+```
+
+
+Aggregated limiting factors
+```{r}
+limsite=reshape2::dcast(data = shapcurrdf,formula = site + Longitude + Latitude ~ fname,value.var = 'shap',fun.aggregate = sum)
+cols=colnames(limsite)[c(-1,-2,-3)]
+limsite$sel=cols[apply(limsite[,cols],1,which.max)]
+limsite$var=as.character(varname_r[limsite$sel])
+limsite$vargroup=vargroups[limsite$var,]
+limsite$color=unlist(colors)[limsite$vargroup]
+
+pdf('globallimitingfactors.pdf',width = 5,height = 5)
+g=ggplot(limsite)+
+    geom_map(map=gbr_map, data=gbr_map,
+                     aes(x=long, y=lat, map_id=id),
+                     fill='#ffffff',
+                     col="#000000")+
+    xlab('Longitude')+ylab('Latitude')+
+    geom_point(aes(x=Longitude,y=Latitude,col=sel))+
+    scale_color_manual(name='Feature',values = fc)+
+    theme(legend.position = "bottom",legend.text = element_text(size=5))+
+    ggtitle('Overall limiting factors')
+  
+g+ guides(color = guide_legend(override.aes = list(size=2)))
+dev.off()
+
+geodata=limsite[,c('Longitude','Latitude')]
+colnames(geodata)=c('x','y')
+data=data.frame(topvar=factor(limsite$sel,levels = cols))
+points <- SpatialPoints(coords=geodata,proj4string = CRS("+proj=longlat +datum=WGS84"),bbox = NULL)
+pixels <- SpatialPixelsDataFrame(points =   points,data=data,tolerance = 0.99999)
+raster <- raster(pixels[,'topvar'])
+
+bgd <- getData('GADM', country='France', level=0)
+plot(bgd,main = t,cex.main=cx)
+raster::plot(x=raster,col=fc[cols],add=TRUE)
+```
+
+
+For each variable, and each taxa => a map
+
+```{r, fig.width=10, fig.height=10}
+library(ggplot2)
+
+gbr <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(gbr, 0.01)
+gbr_map <- fortify(gbr)
+
+#shap_site=aggregate(shapcurrdf[,c('phi')],by=list(lon=shapcurrdf$Longitude,lat=shapcurrdf$Latitude,feature=shapcurrdf$feature,fname=shapcurrdf$fname),FUN=sum)
+
+plot_shap_map<-function(var,t,cx=1,resolution=0.05,f=median){
+  df=subset(shapcurrdf,feature %in% var & class==t)
+    
+  g=ggplot(df)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    xlab('Longitude')+ylab('Latitude')+
+    geom_point(aes(x=Longitude,y=Latitude,col=phi))+
+    facet_wrap(~fname,nrow = 6,ncol = 6)+
+    scale_color_gradient2(midpoint=0,  low="blue", mid="white", high="red" , space = "Lab")
+  
+  
+  return(g)
+}
+
+tnames=codes
+pdf('shap_all.pdf')
+for(t in 1:m){
+  g=plot_shap_map(names(lvars),t=t)+ggtitle(as.character(tnames)[t])
+  plot(g)
+}
+dev.off()
+
+```
+
+
+*****************************************************************************************************************
+                                        COMPUTE PROJECTIONS 
+*****************************************************************************************************************
+
+Land cover filtering non soil
+```{r}
+library(rjson)
+json_file <- 'data/current/clc_filter.json'
+clc_filter <- fromJSON(paste(readLines(json_file), collapse=""))
+df_clc=as.matrix(clc_filter)
+```
+
+Dispersal kernel
+```{r}
+file_dist='data/current/nearest_occur_all.csv'
+dist=read.csv(file_dist)
+
+### aggregate distance to retained taxa only
+subcol=colnames(dist)[-1]
+ldist=lapply(ret_taxa,function(t){
+  tids=intersect(paste('X',subset(taxo,drilo_code==t)$Id_taxon,sep=''),subcol)
+  if(length(tids)>1) apply(dist[,tids],1,min) else if(length(tids)==1) dist[,tids] else rep(0,dim(dist)[1])
+})
+
+dist_df=data.frame(do.call(cbind,ldist))
+colnames(dist_df)=ret_taxa
+```
+-
+Distance decay
+```{r}
+exp_decay<-function(d,to){
+  return(exp(-d*to))
+}
+to=-log(0.5)/100  ###K Probability decreases to half each 100 Km
+decay=exp_decay(dist_df,to)
+```
+
+Predict HS + CLC filter  + dispersal filter
+```{r}
+y_curr=data.frame(hsm_norm_predict(model,X_curr))*clc_filter
+y_bin=data.frame(t(apply(y_curr,1,function(x) x>l_th)))*1*decay
+sp_community=compute_sp_hs(y_bin)
+
+shannon=vegan::diversity(sp_community,index = 'shannon')
+simpson=vegan::diversity(sp_community,index = 'simpson')
+rich=rowSums(sp_community)
+
+alpha_div=cbind(x=curr_env$Longitude,y=curr_env$Latitude,data.frame(cbind(rich,shannon,simpson)))
+
+bgd <- getData("GADM", country="FR", level=0)
+gbr <- gSimplify(bgd, 0.01)
+
+gbr_map <- fortify(gbr)
+
+pdf('alphadiv.pdf',width=5,height=5)
+for (t in c('rich','shannon','simpson')){
+  df=alpha_div[,c('x','y',t)]
+  colnames(df)=c('x','y','target')
+  
+  g=ggplot(data=df)+
+    geom_map(map=gbr_map, data=gbr_map,
+             aes(x=long, y=lat, map_id=id),
+             fill='#ffffff',
+             col="#000000")+
+    geom_point(aes(x=x,y=y,color = target))+
+    scale_color_viridis()+
+    xlab('Longitude')+ylab('Latitude')+ggtitle(t)+
+    theme( axis.text = element_text( size = 12 ),
+           axis.title = element_text( size = 12, face = "bold" ),
+           legend.key.size = unit(12,"pt"),
+           legend.position = 'right',
+           strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+  
+  plot(g)
+}
+dev.off()
+
+df2raster<-function(geodata,target,data,resolution=0.01,f=median,cx=1){
+  ext <- extent(geodata)
+  rst <- raster(ext,resolution=resolution)
+  rstx <- rasterize(geodata, rst, data, fun=f)
+  
+  plot(bgd,main = target,cex.main=cx)
+  plot(rstx,add=TRUE,col=viridis(n = 10))
+}
+
+pdf('paper/final_figures/alphadiv.pdf',width=5,height=5)
+df2raster(geodata = alpha_div[,c('x','y')],target = 'Richness', data=alpha_div[,'rich'],resolution=0.02,f=median,cx=1)
+df2raster(geodata = alpha_div[,c('x','y')],target = 'Shannon', data=alpha_div[,'shannon'],resolution=0.02,f=median,cx=1)
+df2raster(geodata = alpha_div[,c('x','y')],target = 'Simpson', data=alpha_div[,'simpson'],resolution=0.02,f=median,cx=1)
+dev.off()
+```
+
+
+***********************************************************************************************************
+# Aggregate composition to community-level indicators
+For this part, we'll use the habitat suitability indicators without dispersal filtering
+as we're interested in the potential levels
+***********************************************************************************************************
+
+Alpha Diversity
+```{r}
+#th=0.5
+sp_curr=compute_sp_hs(p_hs)
+sp_curr_disp=compute_sp_hs(p_hs_disp)
+
+## Filter with optimal thresholds
+sp_ths=aggregate(as.numeric(sel_th),by=list(species=as.character(species)),mean)
+spth=sp_ths$x
+names(spth)=sp_ths$species
+
+rich_curr=data.frame(richness=colSums(apply(sp_curr,1,function(x) x>spth)))
+rich_curr_disp=data.frame(richness=colSums(apply(sp_curr_disp,1,function(x) x>spth)))
+
+div_curr=data.frame(shannon=vegan::diversity(sp_curr,index='shannon'))
+div_curr_disp=data.frame(shannon=vegan::diversity(sp_curr_disp,index='shannon'))
+
+fg_curr=data.frame(compute_fct_composition(as.matrix(p_hs)))
+fg_curr[is.na(fg_curr)]<-0
+
+fg_curr_disp=data.frame(compute_fct_composition(as.matrix(p_hs_disp)))
+fg_curr_disp[is.na(fg_curr_disp)]<-0
+```
+
+Functional structure
+```{r}
+library(caret)
+
+colnames(p_hs)=rownames(traits_df)
+for(t in ordi_traits){
+  traits_df[[t]]=as.numeric(traits_df[[t]])
+}
+
+for(t in num_traits){
+  traits_df[[t]]=as.numeric(traits_df[[t]])
+}
+
+for(t in cat_traits){
+  traits_df[[t]]=factor(traits_df[[t]],levels=trait_encoding[[t]]$codes)#,labels=trait_encoding[[t]]$names)
+}
+
+traits_df$Irise=as.integer(traits_df$Irise)
+
+
+# dummify the categorical traits
+dmy <- dummyVars(" ~ .", data = traits_df[,cat_traits])
+trsf <- data.frame(predict(dmy, newdata = traits_df[,cat_traits]))
+x=cbind(traits_df[,c(num_traits,ordi_traits)],trsf)
+
+### compute cwm
+a=t(apply(p_hs, 1, function(x) x>as.numeric(ths))*1)
+cws=data.frame((a%*%as.matrix(x))/sapply(rowSums(a),function(x) max(x,1)))
+colnames(cws)=colnames(x)
+cws[,ordi_traits]=round(cws[,ordi_traits],0)
+
+### same with p_hs_disp
+a_disp=t(apply(p_hs_disp, 1, function(x) x>as.numeric(ths))*1)
+cws_disp=data.frame((a_disp%*%as.matrix(x))/sapply(rowSums(a_disp),function(r) max(r,1)))
+colnames(cws_disp)=colnames(x)
+cws_disp[,ordi_traits]=round(cws_disp[,ordi_traits],0)
+```
+
+All projections
+```{r}
+colnames(p_hs)=as.character(tnames)
+all_proj=cbind(Longitude=curr_env$Longitude,Latitude=curr_env$Latitude,
+               curr_env[,c(num_vars,cat_vars)],
+                        p_hs,
+                        richness=rich_curr,
+                        shannon=div_curr,
+                        fg_curr,
+                        cws)
+
+
+colnames(p_hs_disp)=as.character(tnames)
+all_proj_disp=cbind(Longitude=curr_env$Longitude,Latitude=curr_env$Latitude,
+               curr_env[,c(num_vars,cat_vars)],
+                        p_hs_disp,
+                        richness=rich_curr_disp,
+                        shannon=div_curr_disp,
+                        fg_curr_disp,
+                        cws_disp)
+
+saveRDS(all_proj,'paper/final_figures/curr_proj_HS.rds')
+saveRDS(all_proj_disp,'paper/final_figures/curr_proj_disp100km.rds')
+```
+
+
+*****************************************************************************************************************
+                                       PROJECTION MAPS
+*****************************************************************************************************************
+
+Viz maps
+```{r}
+proj_hs_div=readRDS('empirical/projection/curr_proj_HS.rds')
+proj_disp_div=readRDS('empirical/projection/curr_proj_disp100km.rds')
+```
+
+```{r}
+pdf('paper/final_figures/maps/projections/Traits.pdf',width = 5,height = 5)
+  
+  ### Continuous traits
+  plot_sf_map('Max_length','Maximum length',T)+
+    scale_color_gradient2(midpoint=max(all_proj$Max_length)/2,  
+                              low="white", #mid="grey",
+                          high="blue" , space = "Lab")
+  
+  plot_sf_map('Max_weight','Maximum weight',T)+
+    scale_color_gradient2(midpoint=max(all_proj$Max_weight)/2,  
+                              low="white", #mid="grey",
+                          high="blue" , space = "Lab")
+  
+  plot_sf_map('Max_diameter','Maximum diameter',T)+
+    scale_color_gradient2(midpoint=max(all_proj$Max_diameter)/2,  
+                              low="white", #mid="grey",
+                          high="blue" , space = "Lab")
+  
+  cols=colnames(all_proj)
+  for(ct in cat_traits){
+    tv=cols[grep(paste(ct,'.[0-9]*',sep=''),cols)]
+    all_proj[[ct]]=trait_encoding[[ct]]$names[apply(all_proj[,tv],1,which.max)]
+    
+    ## Plot map ##
+    df=all_proj[,c('Longitude','Latitude',ct)]
+    colnames(df)=c('x','y','target')
+    
+    ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+    st_set_crs(4326)
+  
+  
+    gbr <- getData("GADM", country="FR", level=0)
+    gbr <- gSimplify(gbr, 0.01)
+    gbr_map <- fortify(gbr)
+  
+    g=ggplot(data=ew_geo)+
+      geom_map(map=gbr_map, data=gbr_map,
+                        aes(x=long, y=lat, map_id=id),
+                        fill='#ffffff',
+                        col="#000000")+
+      geom_sf(aes(color = target))+
+      scale_color_brewer(name='Cluster',palette='Dark2')+
+      xlab('Longitude')+ylab('Latitude')+ggtitle(ct)+
+      theme( axis.text = element_text( size = 12 ),
+               axis.title = element_text( size = 12, face = "bold" ),
+             legend.key.size = unit(12,"pt"),
+             legend.position = 'right',
+             strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+    
+    plot(g)
+    
+  }
+
+dev.off()
+```
+
+Cat trait maps classes
+```{r}
+pdf('paper/final_figures/maps/projections/Traits_classes_disp.pdf',width = 5,height = 5)
+  
+  
+  cols=colnames(proj_disp_div)
+  for(ct in cat_traits){
+    tv=cols[grep(paste(ct,'.[0-9]*',sep=''),cols)]
+    proj_disp_div[[ct]]=trait_encoding[[ct]]$names[apply(proj_disp_div[,tv],1,which.max)]
+    
+    ## Plot map ##
+    df=proj_disp_div[,c('Longitude','Latitude',ct)]
+    colnames(df)=c('x','y','target')
+    
+    ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+    st_set_crs(4326)
+  
+  
+    gbr <- getData("GADM", country="FR", level=0)
+    gbr <- gSimplify(gbr, 0.01)
+    gbr_map <- fortify(gbr)
+  
+    g=ggplot(data=ew_geo)+
+      geom_map(map=gbr_map, data=gbr_map,
+                        aes(x=long, y=lat, map_id=id),
+                        fill='#ffffff',
+                        col="#000000")+
+      facet_wrap(~target)+
+      geom_sf(aes(color = target))+
+      scale_color_brewer(name='Cluster',palette='Dark2')+
+      xlab('Longitude')+ylab('Latitude')+ggtitle(ct)+
+      theme( axis.text = element_text( size = 12 ),
+               axis.title = element_text( size = 12, face = "bold" ),
+             legend.key.size = unit(12,"pt"),
+             legend.position = 'right',
+             strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+    
+    plot(g)
+    
+  }
+
+dev.off()
+```
+
+
+Cat traits maps
+```{r}
+pdf('paper/final_figures/maps/projections/Traits_cat.pdf',width = 5,height = 5)
+  
+  cols=colnames(all_proj)
+  for(ct in cat_traits){
+    tv=cols[grep(paste(ct,'.[0-9]*',sep=''),cols)]
+
+    ## Plot map ##
+    subdf=all_proj[,c('Longitude','Latitude',tv)]
+    colnames(subdf)=c('x','y',trait_encoding[[ct]]$names)
+    
+    df=melt(subdf,id.vars = c('x','y'))
+    
+    ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+    st_set_crs(4326)
+  
+    gbr <- getData("GADM", country="FR", level=0)
+    gbr <- gSimplify(gbr, 0.01)
+    gbr_map <- fortify(gbr)
+  
+    g=ggplot(data=df)+
+      geom_map(map=gbr_map, data=gbr_map,
+                        aes(x=long, y=lat, map_id=id),
+                        fill='#ffffff',
+                        col="#000000")+
+      geom_point(aes(x=x,y=y,color = value))+
+      facet_wrap(~variable)+
+      scale_color_viridis()+
+      #scale_color_brewer(name='Cluster',palette='Dark2')+
+      xlab('Longitude')+ylab('Latitude')+ggtitle(ct)+
+      theme( axis.text = element_text( size = 12 ),
+               axis.title = element_text( size = 12, face = "bold" ),
+             legend.key.size = unit(12,"pt"),
+             legend.position = 'right',
+             strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+    
+    plot(g)
+    
+  }
+
+dev.off()
+```
+Cat traits maps
+```{r}
+pdf('paper/final_figures/maps/projections/Traits_cat_disp.pdf',width = 5,height = 5)
+  
+  cols=colnames(all_proj_disp)
+  for(ct in cat_traits){
+    tv=cols[grep(paste(ct,'.[0-9]*',sep=''),cols)]
+
+    ## Plot map ##
+    subdf=all_proj_disp[,c('Longitude','Latitude',tv)]
+    colnames(subdf)=c('x','y',trait_encoding[[ct]]$names)
+    
+    df=melt(subdf,id.vars = c('x','y'))
+    
+    ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+    st_set_crs(4326)
+  
+    gbr <- getData("GADM", country="FR", level=0)
+    gbr <- gSimplify(gbr, 0.01)
+    gbr_map <- fortify(gbr)
+  
+    g=ggplot(data=df)+
+      geom_map(map=gbr_map, data=gbr_map,
+                        aes(x=long, y=lat, map_id=id),
+                        fill='#ffffff',
+                        col="#000000")+
+      geom_point(aes(x=x,y=y,color = value))+
+      facet_wrap(~variable)+
+      scale_color_viridis()+
+      #scale_color_brewer(name='Cluster',palette='Dark2')+
+      xlab('Longitude')+ylab('Latitude')+ggtitle(ct)+
+      theme( axis.text = element_text( size = 12 ),
+               axis.title = element_text( size = 12, face = "bold" ),
+             legend.key.size = unit(12,"pt"),
+             legend.position = 'right',
+             strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+    
+    plot(g)
+    
+  }
+
+dev.off()
+```
+*****************************************************************************************************************
+                                        DIVERSITY MAPS
+*****************************************************************************************************************
+
+
+*****************************************************************************************************************
+                                        DIVERSITY COMPUTATION
+*****************************************************************************************************************
+
+Alpha, beta, gamma diversity (Leinster and cobbold framework) for mapping diversity
+```{r}
+all_proj=readRDS('empirical/projection/curr_proj_HS.rds')
+all_proj_disp=readRDS('empirical/projection/curr_proj_disp100km.rds')
+source('abg.leinster2.R')
+```
+
+
+```{r}
+##################################################################################################
+##Set distance matrices
+mat_dist_func=as.matrix(FD::gowdis(traits_df))
+colnames(mat_dist_func)=rownames(mat_dist_func)=as.character(tnames)
+
+mat_dist_phylo=as.matrix(phyl_dist)
+colnames(mat_dist_phylo)=rownames(mat_dist_phylo)=subtaxa_names
+```
+
+```{r}
+## Distance to neighbor matrix
+folder_nns='empirical/projection/'
+file_nns='empirical/projection/neighbors_10.json'
+dn=fromJSON(paste(readLines(file_nns), collapse=""))
+
+```
+
+```{r}
+##################################################################################################
+### CALCUL POUR CHAQUE SCENARIO DES DIVERSITES TAXO, FONCTIO POUR Q=0
+wrapper2 <- function(data,dn,tdist,fdist,pdist,qlist=c(0,1,2)) {
+  td_q <- list()
+  fd_q <- list()
+  pd_q <- list()
+  
+  for (i in 1:length(dn)) {  ###only sites for which we know the neighbors
+      #print(i)
+      n<-length(dn[[i]])
+      
+      if (n<3) {
+          td_q[[i]] <- rep(-1,length(qlist))
+          fd_q[[i]] <- rep(-1,length(qlist))
+          pd_q[[i]] <- rep(-1,length(qlist))
+          #i<-i+1 
+      }
+      else {
+          adj <- dn[[i]]
+          val <- data[adj,]
+          
+          sel_row=which(rowSums(val)>0)
+          sel_col=which(colSums(val)>0)
+          
+          val <- matrix(val[sel_row,sel_col],nrow=length(sel_row),ncol=length(sel_col))
+          colnames(val)=names(sel_col)
+          
+          if (ncol(val)>0 & nrow(val)>1) {
+            ## Taxonomic
+            td_q[[i]] = sapply(qlist, function(q){
+              true.abg(spxp = val,q=q,dis=(1-diag(ncol(val))),std.value=1) 
+            })
+            
+            ## Functional
+            fd_q[[i]] = sapply(qlist, function(q){
+              true.abg(spxp = val,dis=fdist[colnames(val),colnames(val)],
+                        q=q,std.value=max(fdist[colnames(val),colnames(val)])) 
+            })
+            
+            ## Phylogenetic
+            pd_q[[i]] = sapply(qlist, function(q){
+              true.abg(spxp = val,dis=pdist[colnames(val),colnames(val)],
+                        q=q,std.value=max(pdist[colnames(val),colnames(val)])) 
+            })
+              
+          }else {
+              td_q[[i]] <- rep(-1,length(qlist))
+              fd_q[[i]] <- rep(-1,length(qlist))
+              pd_q[[i]] <- rep(-1,length(qlist))
+          }          
+          rm(adj, val)
+      }
+  }
+  return(c(td_q,fd_q,pd_q))
+}
+```
+
+```{r}
+wrapper3 <- function(data,dn,tdist,fdist,pdist,qlist=c(0,1,2)) {
+  td_q <- list()
+  fd_q <- list()
+  pd_q <- list()
+  
+  for (i in 1:length(dn)) {  ###only sites for which we know the neighbors
+      #print(i)
+      n<-length(dn[[i]])
+      
+      adj <- dn[[i]]
+      val <- data[adj,]
+          
+      sel_row=which(rowSums(val)>0)
+      sel_col=which(colSums(val)>0)
+      
+      val <- matrix(val[sel_row,sel_col],nrow=length(sel_row),ncol=length(sel_col))
+      colnames(val)=names(sel_col)
+          
+      ## Taxonomic
+      td_q[[i]] = sapply(qlist, function(q){
+        true.abg(spxp = val,q=q,dis=(1-diag(ncol(val))),std.value=1) 
+      })
+            
+      ## Functional
+      fd_q[[i]] = sapply(qlist, function(q){
+        true.abg(spxp = val,dis=fdist[colnames(val),colnames(val)],
+                  q=q,std.value=max(fdist[colnames(val),colnames(val)])) 
+      })
+            
+      ## Phylogenetic
+      pd_q[[i]] = sapply(qlist, function(q){
+        true.abg(spxp = val,dis=pdist[colnames(val),colnames(val)],
+                  q=q,std.value=max(pdist[colnames(val),colnames(val)])) 
+      })
+              
+  }
+  return(c(td_q,fd_q,pd_q))
+}
+```
+
+
+Taxonomic diversity => for this we'll use species-level probabilities of occurrence
+(To follow the classical definition of the indices that are defined for species). This is justified by the fact that the taxonomic depth of the modeled taxa is variable, hence we need to unify all levels. The deepest common level is the species level. 
+
+For functional and phylogenetic diversity, we'll use the finest grain possible. In the case of phylogenetic data this won't do harm as phylo distances are conserved between subspecies and varieties of the same species. In the case of traits, it's best to use the most precise information, particularly if intraspecific variability is existent. If not, the similarity of traits is aggregated anyway. 
+
+
+```{r}
+library(foreach)
+library(doParallel)
+
+n=549486
+m=77
+th=0.5
+dis=diag(m)
+
+codes=colnames(all_proj_disp)[39:(39+77-1)]
+sp_curr=as.matrix((all_proj_disp[,codes]>th)*1)
+
+saveRDS(sp_curr,file='sp_curr.rds')
+saveRDS(mat_dist_func,file='fdist.rds')
+saveRDS(mat_dist_phylo,file='pdist.rds')
+
+##Create binary matrix of neighbors
+cores=detectCores()
+cl <- makeCluster(cores[1]-1) #not to overload your computer
+registerDoParallel(cl)
+
+for(cpt in 0:5){
+  dns=foreach(i=(cpt*100):min((cpt+1)*100,548),.combine = c) %dopar% {
+    file_nns=sprintf('empirical/projection/neighbors/neighbors_100_%d.json',i)
+    dn=rjson::fromJSON(paste(readLines(file_nns), collapse=""))
+    divq_i=wrapper3(data=sp_curr,dn=dn,tdist=NULL,fdist=mat_dist_func,pdist=mat_dist_phylo,qlist=c(0,1,2))
+  }
+}
+stopCluster(cl)
+```
+
+
+Without dispersal
+```{r}
+#setup parallel backend to use many processors
+cores=detectCores()
+cl <- makeCluster(cores[1]-1) #not to overload your computer
+clusterExport(cl,list('wrapper2'))
+registerDoParallel(cl)
+
+sp_curr=all_proj_disp[,codes]
+
+### Diversity R=100km###
+taxo_q0<-c()
+fct_q0<-c()
+phyl_q0<-c()
+for(cpt in 0:10){
+  dns=foreach(i=(cpt*50):min((cpt+1)*50,548),.combine = c) %dopar% {
+    file_nns=sprintf('empirical/projection/neighbors/neighbors_100_%d.json',i)
+    dn=rjson::fromJSON(paste(readLines(file_nns), collapse=""))
+  }
+  
+  taxo_q0 <-  c(taxo_q0,wrapper2(data = as.matrix((sp_curr>th)*1),
+                       dn = dns,dist = NULL,qlist = c(0)))
+  
+  fct_q0 <- c(fct_q0,wrapper2(data = as.matrix((sp_curr>th)*1),
+                     dn = dns,dist = mat_dist_func,qlist = c(0)))
+  
+  phyl_q0 <- c(phyl_q0,wrapper2(data = as.matrix((sp_curr>th)*1),
+                      dn = dns,dist = mat_dist_phylo,qlist = c(0)))
+}
+
+saveRDS(taxo_q0,'empirical/projection/taxo_q0.rds')
+saveRDS(fct_q0,'empirical/projection/fct_q0.rds')
+saveRDS(phyl_q0,'empirical/projection/phylo_q0.rds')
+
+#stop cluster
+stopCluster(cl)
+```
+
+With dispersal
+```{r}
+taxo_q0 <-  wrapper2(data = as.matrix((sp_curr_disp>th)*1),
+                     dn = dn,dist = NULL,qlist = c(0))
+
+saveRDS(taxo_q0,'empirical/projection/taxo_q0_disp.rds')
+
+fct_q0 <- wrapper2(data = as.matrix((p_hs_disp>th)*1),
+                   dn = dn,dist = mat_dist_func,qlist = c(0))
+
+saveRDS(fct_q0,'empirical/projection/fct_q0_disp.rds')
+
+phyl_q0 <- wrapper2(data = as.matrix((p_hs_disp[,subtaxa_names]>th)*1),
+                    dn = dn,dist = mat_dist_phylo,qlist = c(0))
+
+saveRDS(phyl_q0,'empirical/projection/phylo_q0_disp.rds')
+```
+
+
+
+```{r}
+taxo_q12 <-  wrapper2(data = as.matrix(sp_curr),
+                      dn = dn,dist = NULL,qlist = c(1,2))
+
+saveRDS(taxo_q12,'empirical/projection/taxo_q12.rds')
+
+fct_q12 <-  wrapper2(data = as.matrix(p_hs),
+                     dn = dn,dist =mat_dist_func,qlist = c(1,2))
+
+saveRDS(fct_q12,'empirical/projection/fct_q12.rds')
+
+phyl_q12 <-  wrapper2(data = as.matrix(p_hs[,subtaxa_names]),
+                      dn = dn,dist =mat_dist_phylo,qlist = c(1,2))
+
+saveRDS(phyl_q12,'empirical/projection/phylo_q12.rds')
+```
+
+###################################################################
+Combining all data
+
+```{r}
+proj_hs=readRDS("empirical/projection/curr_proj_HS.rds")
+taxo_q0=readRDS("empirical/projection/taxo_q0.rds")
+fct_q0=readRDS("empirical/projection/fct_q0.rds")
+phyl_q0=readRDS("empirical/projection/phylo_q0.rds")
+
+n=length(taxo_q0)
+alldiv=data.frame(do.call(rbind,lapply(1:n, function(i){
+  unlist(c(taxo_q0[[i]][1:3],fct_q0[[i]][1:3],phyl_q0[[i]][1:3]))
+})))
+
+colnames(alldiv)=c('taxo_gamma','taxo_beta','taxo_alpha','fct_gamma','fct_beta','fct_alpha',
+                   'phylo_gamma','phylo_beta','phylo_alpha')
+
+proj_hs_div=cbind(proj_hs,alldiv)
+```
+
+###################################################################
+Combining all data - with dispersal
+
+```{r}
+proj_disp=readRDS("empirical/projection/curr_proj_disp100km.rds")
+taxo_q0_disp=readRDS("empirical/projection/taxo_q0_disp.rds")
+fct_q0_disp=readRDS("empirical/projection/fct_q0_disp.rds")
+phyl_q0_disp=readRDS("empirical/projection/phylo_q0_disp.rds")
+
+n=length(taxo_q0_disp)
+alldiv_disp=data.frame(do.call(rbind,lapply(1:n, function(i){
+  unlist(c(taxo_q0_disp[[i]][1:3],fct_q0_disp[[i]][1:3],phyl_q0_disp[[i]][1:3]))
+})))
+
+colnames(alldiv_disp)=c('taxo_gamma','taxo_beta','taxo_alpha','fct_gamma','fct_beta','fct_alpha',
+                   'phylo_gamma','phylo_beta','phylo_alpha')
+
+proj_disp_div=cbind(proj_disp,alldiv_disp)
+```
+
+
+**********************************************************************************************************************************
+                                        PROJECTIONS  VIZ
+**********************************************************************************************************************************
+
+```{r}
+library(mapproj)
+library(ggspatial)
+library(reshape2)
+library(plotly)
+
+plot_sf_map<-function(t,title,disp=F){
+  if(disp) df=all_proj_disp[,c('Longitude','Latitude',t)] else df=all_proj[,c('Longitude','Latitude',t)]
+  
+  colnames(df)=c('x','y','target')
+  
+  ew_geo <- st_as_sf(df, coords = c('x','y')) %>%
+    st_set_crs(4326)
+  
+  
+  gbr <- getData("GADM", country="FR", level=0)
+  gbr <- gSimplify(gbr, 0.01)
+  gbr_map <- fortify(gbr)
+  
+  g=ggplot(data=ew_geo)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    geom_sf(aes(color = target))+
+    xlab('Longitude')+ylab('Latitude')+ggtitle(title)+
+    theme( axis.text = element_text( size = 12 ),
+             axis.title = element_text( size = 12, face = "bold" ),
+           legend.key.size = unit(12,"pt"),
+           legend.position = 'right',
+           strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+  
+  
+  return(g)
+}
+
+plot_pt_map<-function(t,title='',disp=F){
+  if(disp) df=proj_disp_div[,c('Longitude','Latitude',t)] else df=proj_hs_div[,c('Longitude','Latitude',t)]
+  
+  colnames(df)=c('x','y','target')
+  
+  gbr <- getData("GADM", country="FR", level=0)
+  gbr <- gSimplify(gbr, 0.01)
+  gbr_map <- fortify(gbr)
+  
+  g=ggplot(data=df)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    geom_point(aes(x=x,y=y,color = target))+
+    xlab('Longitude')+ylab('Latitude')+ggtitle(title)+
+    theme( axis.text = element_text( size = 12 ),
+             axis.title = element_text( size = 12, face = "bold" ),
+           legend.key.size = unit(12,"pt"),
+           legend.position = 'right',
+           strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+  
+  
+  return(g)
+}
+
+getmode <- function(v,na.rm=T) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+df2raster<-function(geodata,data,resolution=0.01,f=median,cx=1){
+  ext <- extent(geodata)
+  rst <- raster(ext,resolution=resolution)
+  rstx <- rasterize(geodata, rst, data, fun=f)
+  
+  bgd <- getData('GADM', country='France', level=0)
+  plot(bgd,main = t,cex.main=cx)
+  plot(rstx,add=TRUE)
+}
+
+plot_map<-function(t,disp=F,resolution=0.01,f=median,cx=1){
+  if(disp) proj_df=proj_disp_div else proj_df=proj_hs_div
+  df=proj_df[,c('Longitude','Latitude',t)]
+  colnames(df)=c('x','y','target')
+    
+  #get some sample data
+  geodata=df[,c('x','y')]
+  
+  df2raster(geodata,df$target,resolution,f,cx)
+}
+
+eps=0.01
+### Plot in ternary
+plot_pt_ternary<-function(){
+  # Show taxa in simplex
+  # Add data points
+  n=dim(data)[1]
+  data_points <- lapply(1:n,function(i) as.numeric(data[i,]))
+  names(data_points)=as.character(1:n)
+    
+  TernaryPlot(alab="Epigeic \u2192", blab="\u2190 Endogeic", clab="Anecic \u2192",
+              lab.col=c('red', 'darkgreen', 'blue'),
+              point='right', lab.cex=0.8, grid.minor.lines=0,
+              grid.lty='solid', col=rgb(0.9, 0.9, 0.9), grid.col='white', 
+              axis.col=rgb(0.6, 0.6, 0.6), ticks.col=rgb(0.6, 0.6, 0.6),
+              padding=0.08)
+  
+  # Colour the background:
+  cols <- TernaryPointValues(rgb)
+  ColourTernary(cols, spectrum = NULL)
+}
+```
+
+```{r}
+hs=F
+if(hs){
+  pdf('HabSuit.pdf')
+  for(t in codes){
+    g=plot_sf_map(t,paste('HS ',t),F)+scale_color_viridis_c(direction=-1)
+    plot(g)
+  }
+  dev.off()  
+  pdf('HabSuitDisp.pdf')
+  for(t in codes){
+    g=plot_sf_map(t,paste('HS+Disp ',t),T)
+    plot(g)
+  }
+  dev.off()
+}
+
+hsfast=F
+if(hsfast){
+pdf('hs_maps.pdf')
+for(t in codes){
+  plot_map(t,F)
+}
+dev.off()
+pdf('hs_disp_maps.pdf')
+for(t in codes){
+  plot_map(t,T)
+}
+dev.off()
+}
+```
+
+Fct group map
+```{r}
+curr_fg=data.frame(compute_fct_composition(as.matrix(p_hs))[,c('p_epigeic','p_endogeic','p_anecic')])
+curr_fg_disp=data.frame(compute_fct_composition(as.matrix(p_hs_disp))[,c('p_epigeic','p_endogeic','p_anecic')])
+
+curr_fg[is.na(curr_fg)]=0
+curr_fg_disp[is.na(curr_fg_disp)]=0
+
+n=dim(curr_fg)[1]
+p_hs$fg=sapply(1:n, function(i){
+  coords=as.numeric(curr_fg[i,])
+  if(sum(coords)==0) col='#FFFFFFFF' else col=rgb(coords[1],coords[2],coords[3],1)
+  return(col)
+})
+
+p_hs_disp$fg=sapply(1:n, function(i){
+  coords=as.numeric(curr_fg_disp[i,])
+  if(sum(coords)==0) col='#FFFFFFFF'
+  else col=rgb(coords[1],coords[2],coords[3],1)
+  return(col)
+})
+
+geo=data.frame(cbind(Longitude=curr_env$Longitude,Latitude=curr_env$Latitude))
+p_hs=cbind(geo,p_hs)
+p_hs_disp=cbind(geo,p_hs_disp)
+
+### Map of community-level functional group distribution 
+##Without dispersal
+plot_pt_map<-function(t,title='',disp=F){
+  if(disp) df=p_hs_disp[,c('Longitude','Latitude',t)] else df=p_hs[,c('Longitude','Latitude',t)]
+  
+  colnames(df)=c('x','y','target')
+  
+  gbr <- getData("GADM", country="FR", level=0)
+  gbr <- gSimplify(gbr, 0.01)
+  gbr_map <- fortify(gbr)
+  
+  g=ggplot(data=df)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    geom_point(aes(x=x,y=y,color = target))+
+    xlab('Longitude')+ylab('Latitude')+ggtitle(title)+
+    theme( axis.text = element_text( size = 12 ),
+             axis.title = element_text( size = 12, face = "bold" ),
+           legend.key.size = unit(12,"pt"),
+           legend.position = 'right',
+           strip.text.x = element_text(size = 12),title = element_text(size=12, face="bold"))
+  
+  
+  return(g)
+}
+fgg=plot_pt_map('fg','Ecological structure - hs',F)+scale_colour_identity()
+fgg
+
+##With dispersal filter
+fggdisp=plot_pt_map('fg','Ecological structure - dispersal',T)+scale_colour_identity()
+
+pdf('paper/interp/projections/fgmap.pdf',width = 10,height = 10)
+fggdisp
+dev.off()
+#plot_sf_map('fg','Ecological strategies',disp = T)+scale_colour_identity()
+
+###Create thematic map
+
+```
+
+Taxonomic diversity maps
+c(                  'taxo_gamma','taxo_beta','taxo_alpha',
+                    'fct_gamma','fct_beta','fct_alpha',
+                   'phylo_gamma','phylo_beta','phylo_alpha')
+```{r}
+pdf('DiversityMaps.pdf')
+##Taxonomic
+plot_sf_map('taxo_alpha','Taxo alpha',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('taxo_alpha','Taxo alpha - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('taxo_beta','Taxo beta',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('taxo_beta','Taxo beta - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('taxo_gamma','Taxo gamma',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('taxo_gamma','Taxo gamma - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+##Functional
+plot_sf_map('fct_alpha','fct alpha',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('fct_alpha','fct alpha - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('fct_beta','fct beta',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('fct_beta','fct beta - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('fct_gamma','fct gamma',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('fct_gamma','fct gamma - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+##Phylogenetic
+plot_sf_map('phylo_alpha','phylo alpha',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('phylo_alpha','phylo alpha - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('phylo_beta','phylo beta',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('phylo_beta','phylo beta - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+plot_sf_map('phylo_gamma','phylo gamma',F)+scale_color_viridis_c(direction=-1)
+plot_sf_map('phylo_gamma','phylo gamma - dispersal',T)+scale_color_viridis_c(direction=-1)
+
+dev.off()
+```
+
+
+Clustering taxa and sites based on shapley values
+
+Sites
+```{r}
+library(reshape2)
+library(factoextra)
+library(cluster)
+
+shapsite=dcast(shap_global,feature + group + class ~ site,value.var = 'phi')
+shaptaxa=dcast(shap_global,feature + group + site ~ class,value.var = 'phi')
+```
+
+
+```{r}
+##current
+shapcurrdf$group= vargroups[shapcurrdf$feature,]
+cshapsite=dcast(shapcurrdf,feature  + group + class ~ site,value.var = 'phi')
+cshaptaxa=dcast(shapcurrdf,feature +  group + site ~ class,value.var:!m = 'phi')
+set.seed(123)
+```
+
+
+```{r}
+df=t(as.matrix(shapsite[,-c(1,2,3)]))  #=> basis for clustering
+
+find_opt=F
+
+if(find_opt){
+optkmeans=fviz_nbclust(
+  x=df,
+  FUNcluster = kmeans,
+  method = "wss",
+  k.max = 10
+)
+
+optpam=fviz_nbclust(
+  x=df,
+  FUNcluster = cluster::pam,
+  method = "silhouette",
+  k.max = 10
+)
+
+optkmeans
+kclust=kmeans(df,5)
+fviz_cluster(
+  kclust,
+  data = df,
+  ellipse.type = 'norm',
+)
+
+optpam
+pclust=cluster::pam(df,6)
+fviz_cluster(
+  pclust,
+  data = df,
+  ellipse.type = 'norm'
+)
+}
+
+kclust=kmeans(df,5)
+```
+
+
+Taxa
+```{r, fig.width=10}
+fgroups=c("hydro"     ,    "temperature" ,  "precipitation" , "physchem"  ,    "structural" ,   "landcover" )
+find_opt=T
+for (fg in fgroups){
+  print(fg)
+  subshaptaxa=subset(shaptaxa,group %in% c(fg))
+  df=t(as.matrix(subshaptaxa[,-c(1,2,3)]))
+  rownames(df)=codes
+  
+  meth=pam
+  if(find_opt){
+    optwss=fviz_nbclust(
+      x=df,
+      FUNcluster = meth,
+      method = "wss",
+      k.max = 10
+    )
+    gap_stat <- cluster::clusGap(df, FUN = meth, K.max = 10, B = 10)
+    print(gap_stat,method='firstSEmax')
+    print(gap_stat,method='globalSEmax')
+    plot(fviz_gap_stat(gap_stat))
+    plot(optwss)
+  }
+  plot(fviz_cluster(pam(df,3)))
+  plot(fviz_cluster(pam(df,4)))
+  plot(fviz_cluster(pam(df,5)))
+  
+  plot(fviz_cluster(pam(df,3),repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'3-medoids')))
+  plot(fviz_cluster(pam(df,4),repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'4-medoids')))
+  plot(fviz_cluster(pam(df,5),repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'5-medoids')))
+  plot(fviz_cluster(pam(df,8),repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'8-medoids')))
+  
+  
+  meth=kmeans
+  if(find_opt){
+    optwss=fviz_nbclust(
+      x=df,
+      FUNcluster = meth,
+      method = "wss",
+      k.max = 10
+    )
+    gap_stat <- cluster::clusGap(df, FUN = meth, K.max = 10, B = 10)
+    print(gap_stat,method='firstSEmax')
+    print(gap_stat,method='globalSEmax')
+    plot(fviz_gap_stat(gap_stat))
+    plot(optwss)
+  }
+  
+  plot(fviz_cluster(kmeans(df,3),data = df))
+  plot(fviz_cluster(kmeans(df,4),data=df))
+  plot(fviz_cluster(kmeans(df,5),data=df))
+  
+  plot(fviz_cluster(kmeans(df,3),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'3-means')))
+  plot(fviz_cluster(kmeans(df,4),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'4-means')))
+  plot(fviz_cluster(kmeans(df,5),df,repel = T,show.clust.cent = T,ellipse.type = 'norm',main=paste(fg,'5-means')))
+      
+  
+  meth=hcut
+  if(find_opt){
+    optwss=fviz_nbclust(
+      x=df,
+      FUNcluster = meth,
+      method = "wss",
+      k.max = 10
+    )
+    gap_stat <- cluster::clusGap(df, FUN = meth, K.max = 10, B = 10)
+    print(gap_stat,method='firstSEmax')
+    print(gap_stat,method='globalSEmax')
+    plot(fviz_gap_stat(gap_stat))
+    plot(optwss)
+  }   
+  
+  plot(fviz_cluster(hcut(df,3),data = df))
+  plot(fviz_cluster(hcut(df,4),data=df))
+  plot(fviz_cluster(hcut(df,5),data=df))
+  
+  plot(fviz_cluster(hcut(df,3),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'3-hcut')))
+  plot(fviz_cluster(hcut(df,4),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'4-hcut')))
+  plot(fviz_cluster(hcut(df,5),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste(fg,'5-hcut')))
+    
+  
+  # for(nc in 2:5){
+  #   plot(fviz_cluster(hcut(df,nc),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste('HCLUST',fg,nc)))
+  #   plot(fviz_cluster(kmeans(df,nc),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste('KMEANS',fg,nc)))
+  # }
+  # p=ggdendrogram(hcut(df),rotate = T)+ggtitle(fg)
+  # ggsave(paste('paper/final_figures/response_groups/',fg,'_dendro.png',sep = ''),p,width = 5 ,height = 10)
+  # 
+  # 
+}
+pk=lapply(3:8,function(nc){
+  p=fviz_cluster(pam(df,nc), repel = T,show.clust.cent = T,ellipse.type = 'none',
+                 main=paste('KMEDOIDS',fg,nc))
+})
+
+kk=lapply(3:8,function(nc){
+    p=fviz_cluster(kmeans(df,nc),df,repel = T,show.clust.cent = T,ellipse.type = 'none',
+                   main=paste('KMEANS',fg,nc))
+  })  
+
+hk=lapply(3:8,function(nc){
+    p=fviz_cluster(hcut(df,nc),df,#repel = T,show.clust.cent = T,ellipse.type = 'none',
+                   main=paste('HCLUST',fg,nc))
+  })  
+
+
+## selected config
+kclc=kmeans(df,6)
+fviz_cluster(kclc,df, repel = T,show.clust.cent = F,
+             ellipse.type = 'none',
+                 main=paste('K-MEANS',fg,nc))  
+
+```
+
+```{r,fig.width=15,fig.height=15}
+do.call('grid.arrange',c(pk,ncol=2))
+do.call('grid.arrange',c(kk,ncol=2))
+do.call('grid.arrange',c(hk,ncol=2))
+```
+
+
+```{r}
+df=sp_emb
+write.csv(sp_emb,'taxa_emb.tsv',sep='\t',row.names = F)
+groups=list(
+  name=codes,
+  k3=kmeans(df,3)$cluster,
+  k4=kmeans(df,4)$cluster,
+  k5=kmeans(df,5)$cluster,
+  k6=kmeans(df,6)$cluster,
+  h3=hcut(df,3)$cluster,
+  h4=hcut(df,4)$cluster,
+  h5=hcut(df,5)$cluster,
+  h6=hcut(df,6)$cluster 
+)
+
+groups_df=data.frame(groups)
+rownames(groups_df)=NULL
+
+write.csv(groups_df,'taxa_metadata.tsv',sep='\t',row.names = F)
+
+pdf('paper/final_figures/response_groups/V2/response_emb.pdf')
+fviz_nbclust(sp_emb,FUNcluster = kmeans,k.max = 10)+ggtitle('kmeans')
+fviz_nbclust(sp_emb,FUNcluster = kmeans,k.max = 10,method = 'gap_stat')+ggtitle('kmeans')
+
+for(nc in 2:6){
+    plot(fviz_cluster(kmeans(df,nc),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste('KMEANS EMB',nc)))
+    plot(fviz_cluster(kmeans(df,nc),df,main=paste('KMEANS EMB',nc)))
+}
+
+fviz_nbclust(sp_emb,FUNcluster = hcut,k.max = 10)+ggtitle('hclust')
+fviz_nbclust(sp_emb,FUNcluster = hcut,k.max = 10,method = 'gap_stat')+ggtitle('hclust')
+for(nc in 2:5){
+    plot(fviz_cluster(hcut(df,nc),df,repel = T,show.clust.cent = T,ellipse.type = 'none',main=paste('HCLUST EMB',nc)))
+    plot(fviz_cluster(hcut(df,nc),df,main=paste('HCLUST EMB',nc)))
+}
+
+dev.off()
+
+#pdf(filename = paste('paper/final_figures/response_groups/',fg,'_dendro.pdf',sep = ''),width =5 ,height = 10)
+p=ggdendrogram(hcut(df),rotate = T)+ggtitle('Response embeddings groups')
+ggsave(paste('paper/final_figures/response_groups/emb_dendro.png',sep = ''),p,width = 5 ,height = 10)
+#dev.off()
+
+prepclc=get_dendro(hcut(df,4))
+g9c <- shap_summary(v='clc',vt = 'categorical',shap_global = shap_global,txorder = prepclc$txorder,
+                   titre='Land Cover',scale=clcscales,lpos='right',tcols = prepclc$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+pdf('paper/final_figures/clcrgshap.pdf',width = 20,height = 15)
+#gridExtra::grid.arrange(prep$g1,g9,ncol=2)
+gridExtra::grid.arrange(prepclc$g1,g9c,ncol=2)
+dev.off()
+```
+
+```{r, fig.width=20,fig.height=30}
+do.call('grid.arrange',c(preck,ncol=2))
+```
+
+
+```{r}
+pdf('rg_fg_c.pdf')
+for(fg in fgroups){
+  subshaptaxa=subset(cshaptaxa,group %in% c(fg))
+  df=t(as.matrix(subshaptaxa[,-c(1,2,3)]))
+  rownames(df)=codes
+  
+  plot(fviz_cluster(
+      kmeans(df,5),
+      data = df,
+      ellipse.type = 'norm',
+      repel=T,
+      geom = 'text',
+      main = paste('kmeans ',fg) 
+    ))
+}
+dev.off()
+```
+
+
+Hierarchical clustering
+```{r}
+library(tidyverse)  # data manipulation
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering visualization
+library(dendextend) # for comparing two dendrograms
+```
+
+```{r, fig.width=15}
+dfp=t(as.matrix(shaptaxa[,-c(1,2,3)]))
+rownames(dfp)=codes
+
+# Dissimilarity matrix
+dp <- dist(dfp, method = "euclidean")
+
+# Hierarchical clustering using Complete Linkage
+# Compute with agnes
+hcp <- agnes(dp, method = "ward")
+pltree(hcp, cex = 0.6, hang = -1, main = paste("Abiotic response groups, ",hcp$ac),xlab='Taxa')
+rect.hclust(hcp, k = 5, border = 2:5)
+
+sub_grpp <- cutree(hcp, k = 5)
+fviz_cluster(list(data = dfp, cluster = sub_grpp),ellipse.type = 'norm')
+```
+
+#### Clustering based on current data
+Sites
+```{r}
+df=t(as.matrix(cshapsite[,-c(1,2,3)]))  #=> basis for clustering
+optkmeans=fviz_nbclust(
+  x=df,
+  FUNcluster = kmeans,
+  method = "wss",
+  k.max = 10
+)
+
+optkmeans
+
+kclust=kmeans(df,6)
+geoshap$cluster=kclust$cluster
+
+fviz_cluster(
+  kclust,
+  data = df,
+  ellipse.type = 'norm',
+)
+```
+
+
+Environmental clusters
+```{r}
+shap_geo <- st_as_sf(geoshap, coords = c("Longitude", "Latitude")) %>%
+  st_set_crs(4326)
+
+ggplot(shap_geo)+
+    geom_map(map=gbr_map, data=gbr_map,
+                      aes(x=long, y=lat, map_id=id),
+                      fill='#ffffff',
+                      col="#000000")+
+    xlab('Longitude')+ylab('Latitude')+
+    geom_sf(aes(col=as.factor(cluster),fill=as.factor(cluster)),interpolate=T)+
+    scale_fill_discrete(name='cluster')+
+    scale_color_discrete(name='cluster')
+  
+```
+Taxa
+```{r}
+dfc=t(as.matrix(cshaptaxa[,-c(1,2,3)]))
+rownames(dfc)=codes
+
+# Dissimilarity matrix
+dc <- dist(dfc, method = "euclidean")
+
+# Hierarchical clustering using Complete Linkage
+# Compute with agnes
+hcc <- agnes(dc, method = "ward")
+pltree(hcc, cex = 0.6, hang = -1, main = paste("Abiotic response groups current, ",hcc$ac),xlab='Taxa')
+rect.hclust(hcc, k = 5, border = 2:5)
+
+sub_grpc <- cutree(hcc, k = 5)
+fviz_cluster(list(data = dfc, cluster = sub_grpc),ellipse.type = 'norm')
+```
+
+
+```{r}
+pdf('optimal_clust.pdf')
+##Optimal #clust for past data
+fviz_nbclust(dfp, FUN = hcut, method = "wss")
+
+##Optimal #clust for current data
+fviz_nbclust(dfc, FUN = hcut, method = "wss")
+
+dev.off()
+
+##Respective dendrograms
+pltree(hcp, cex = 0.6, hang = -1, main = paste("Abiotic response groups - past, ",hcp$ac),xlab='Taxa')
+rect.hclust(hcp, k = 5, border = 2:5)
+
+pltree(hcc, cex = 0.6, hang = -1, main = paste("Abiotic response groups - current, ",hcc$ac),xlab='Taxa')
+rect.hclust(hcc, k = 7, border = 2:5)
+
+##Tangled dendrograms
+dend1 <- as.dendrogram (hcp)
+dend2 <- as.dendrogram (hcc)
+
+tanglegram(dend1, dend2)
+```
+
+SHAP response curves on current data
+```{r}
+cbind(sub_grpp,sub_grpc)
+dend1
+dend2
+```
+
+
+```{r, fig.height=15, fig.width=30}
+### Numerical features
+prep<-get_dendro(hcp)
+g2<-shap_summary(v='pH',vt = 'numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='pH_eau',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+g3<-shap_summary(v='CN',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='C.N ratio',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g4<-shap_summary(v='bio_13',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='Precipitation of Wettest Month',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g5<-shap_summary(v='bio_7',vt='numerical',shap_global = shap_global,txorder = prep$txorder,
+                 titre='Annual temperature range',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+
+pdf('shap_past_c.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(prep$g1,g2,g3,g4,g5,ncol=5)
+dev.off()
+```
+
+```{r}
+shapcurrdf$taxa=codes[shapcurrdf$class]
+shapcurrdf$species=as.character(unlist(tax2sp)[shapcurrdf$taxa])
+shapcurrdf$xval=sapply(shapcurrdf$feature.value,
+                        function(x) as.numeric(unlist(strsplit(x,'='))[2]))
+```
+
+```{r,, fig.height=15, fig.width=30}
+prep<-get_dendro(hcp)
+g2<-shap_summary(v='pH',vt = 'numerical',shap_global = shapcurrdf,txorder = prep$txorder,
+                 titre='pH_eau',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+g3<-shap_summary(v='CN',vt='numerical',shap_global = shapcurrdf,txorder = prep$txorder,
+                 titre='C.N ratio',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g4<-shap_summary(v='bio_13',vt='numerical',shap_global = shapcurrdf,txorder = prep$txorder,
+                 titre='Precipitation of Wettest Month',scale=1,lpos = 'bottom',tcols = prep$tcolors)
+g5<-shap_summary(v='bio_7',vt='numerical',shap_global = shapcurrdf,txorder = prep$txorder,
+                 titre='Annual temperature range',scale=10,lpos = 'bottom',tcols = prep$tcolors)
+
+pdf('shap_currentp_c.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(prep$g1,g2,g3,g4,g5,ncol=5)
+dev.off()
+```
+
+
+Categorical shap
+```{r}
+prep<-get_dendro(hcp)
+g7 <- shap_summary(v='wr',vt='categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Water regime',scale=wrscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = wrcolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g8 <- shap_summary('crusting','categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Soil crusting',scale=crusscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = NULL,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g9 <- shap_summary('clc','categorical',shap_global = shap_global,txorder = prep$txorder,
+                   titre='Land Cover Class',scale=clcscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+
+pdf('shap_past_d.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(g1,g7,g8,g9,ncol=4)
+dev.off()
+```
+
+```{r, fig.height = 15,fig.width = 30}
+prep<-get_dendro(hcc)
+g7 <- shap_summary(v='wr',vt='categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Water regime',scale=wrscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = wrcolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g8 <- shap_summary('crusting','categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Soil crusting',scale=crusscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = NULL,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g9 <- shap_summary('clc','categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Land Cover Class',scale=clcscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+
+pdf('shap_current_d.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(prep$g1,g7,g8,g9,ncol=4)
+dev.off()
+```
+
+```{r}
+prep<-get_dendro(hcp)
+g7 <- shap_summary(v='wr',vt='categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Water regime',scale=wrscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = wrcolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g8 <- shap_summary('crusting','categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Soil crusting',scale=crusscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = NULL,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+g9 <- shap_summary('clc','categorical',shap_global = shapcurrdf,txorder = prep$txorder,
+                   titre='Land Cover Class',scale=clcscales,lpos='bottom',tcols = prep$tcolors,
+                   colours = clccolours,shapes = NULL) + guides(color = guide_legend(
+                     override.aes = list(size=5)))
+
+
+pdf('shap_currentp_d.pdf',height = 15,width = 30)
+gridExtra::grid.arrange(prep$g1,g7,g8,g9,ncol=4)
+dev.off()
+```
+
+
+SHAP importance
+```{r,fig.width=20,fig.height=40}
+cshap_imp=aggregate(shapcurrdf[,c('phi')],by=list(shapcurrdf$feature,shapcurrdf$fname,shapcurrdf$group,shapcurrdf$class,shapcurrdf$taxa),FUN=function(x) sum(abs(as.numeric(x))))
+
+colnames(cshap_imp)<-c('feature','fname','group','task','taxa','shap_phi')
+n=dim(geoshap)[1]
+
+g=ggplot(cshap_imp,aes(y=reorder_within(fname,shap_phi/n,taxa),x=shap_phi/n,fill=group))+
+  geom_bar(stat='identity')+
+  scale_y_reordered() +
+  scale_fill_manual(values=unlist(colors))+
+  theme(axis.text.x = element_text(angle = 45))+
+  facet_wrap(~taxa,ncol=7,scales='free_y')+
+  ggtitle('SHAP global feature contributions')
+
+ggsave('shapcurrentimp_task.pdf',g,width =20 ,height = 30)
+```
+
+```{r}
+g=ggplot(cshap_imp,aes(y=reorder(fname,shap_phi/n),x=shap_phi/n,fill=group))+
+  geom_boxplot()+
+  scale_y_reordered() +
+  scale_fill_manual(values=unlist(colors))+
+  theme(axis.text.x = element_text(angle = 45))+
+  ggtitle('SHAP current global feature contributions')+
+  ylab('Feature')+xlab('Average absolute SHAP across sites')
+
+ggsave('shapcurrentimp.pdf',g,width =10 ,height = 10)
+```
+
+
+
