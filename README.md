@@ -1,1 +1,1 @@
-# Digging deeper: explainable deep variational JSDM for French Earthworms
+# Digging deeper: explainable deep JSDM for French Earthworms
