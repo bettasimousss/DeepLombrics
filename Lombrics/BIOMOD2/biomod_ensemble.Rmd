@@ -1,0 +1,397 @@
+---
+title: "Ensemble HSM Lombrics"
+output: html_notebook
+---
+
+##Loading the data
+
+```{r}
+coord  <- read.csv('data/coords.csv',row.names = 1)
+occur  <- read.csv('data/occur.csv')
+read_data<-function(di){
+  env <- read.csv(sprintf('data/train_prep_%d.csv',di))
+  eval <- read.csv(sprintf('data/eval_prep_%d.csv',di))
+  return(list(env=env,eval=eval))
+}
+```
+
+
+## Cross-val scheme
+```{r}
+library(rjson)
+train <- fromJSON(paste(readLines("data/idx_train.json"), collapse=""))
+test <- fromJSON(paste(readLines("data/idx_test.json"), collapse=""))
+
+run=data.frame('RUN1'=unlist(lapply(occur$Id_station,
+           function(x) ifelse(x%in%train,TRUE,FALSE))))
+```
+
+
+## Selecting taxa
+```{r}
+m=dim(occur)[2]
+subnames=colnames(occur)[2:m]
+occur_sel=occur[subnames]
+```
+
+```{r}
+folder_results='.'
+
+##get all folders
+mod_out=list.dirs(path = folder_results, full.names = FALSE, recursive = FALSE)
+
+tofit=setdiff(gsub('_','.',subnames),mod_out)
+```
+
+
+## Function for training using BIOMOD
+```{r}
+library(biomod2)
+library(maxnet)
+biomod_fit<-function(di,i,DataSpecies,Spat,DataSplitTable){
+  
+  output=list()
+  
+  ### Env data
+  data <- read_data(di)
+  
+  X <- data$env
+  
+  ### Formatting data
+  n=tofit[i]
+  myRespName <- n#subnames[i]#paste('X',i,sep='')
+  myResp <- as.numeric(DataSpecies[,i])
+  myRespXY <- Spat
+  myExpl <- X
+  
+  myBiomodData <- biomod2::BIOMOD_FormatingData(
+    resp.var = myResp,
+    expl.var = myExpl,
+    resp.xy = myRespXY,
+    resp.name = myRespName)
+  
+  ## Plotting occurrences
+  #myBiomodData
+  plot(myBiomodData)
+  
+  ## Model configuration
+  myBiomodOption <- biomod2::BIOMOD_ModelingOptions(
+    #GAM=list(family=binomial(link = 'logit')),
+    GBM=list(distribution='bernoulli'),
+    MARS=list(),
+    #MAXENT.Phillips=list(path_to_maxent.jar='maxent/maxent.jar'),
+    SRE=list(quant=0.025)
+  )
+  
+  tryCatch({
+  
+  myBiomodModelOut <- biomod2::BIOMOD_Modeling(
+    myBiomodData,
+    models = c('GBM','RF','GLM'),#,'SRE'),
+    #models.options = myBiomodOption,
+    NbRunEval=3,
+    DataSplit=80,
+    #DataSplitTable=DataSplitTable,
+    Prevalence=length(which(myResp>0))/dim(DataSpecies)[1],
+    VarImport=3,
+    models.eval.meth = c('TSS','ROC','ACCURACY'),
+    SaveObj = TRUE,
+    #rescal.all.models = TRUE,
+    do.full.models = FALSE,
+    modeling.id = n)
+  
+  output$modelout=myBiomodModelOut
+  
+  },
+  
+  
+  error = function(error_condition) {
+    return("Did not work")
+  }
+  )
+  
+  ### Get training performances
+  myBiomodModelEval <- biomod2::get_evaluations(myBiomodModelOut)
+  perfs=t(rowMeans(myBiomodModelEval[,"Testing.data",,,],dims=2))
+   
+  #print variable importances
+  vimp=data.frame(t(rowMeans(get_variables_importance(myBiomodModelOut)[,,,1],dims=2)))
+  colnames(vimp) <- colnames(X)
+   
+  res=data.frame(cbind(perfs,vimp))
+  res$taxa=n
+  res$model=row.names(res)
+  rownames(res)=NULL
+   
+  cols<-c('TSS','ROC','ACCURACY',colnames(X),'taxa','model')
+  
+  output$eval=res[,cols]
+  
+  ### Select optimal threshold
+  th=0.01
+  myBiomodEM <- biomod2::BIOMOD_EnsembleModeling(
+      modeling.output =myBiomodModelOut,
+      chosen.models = 'all',
+      em.by='all',
+      eval.metric = c('TSS'),
+      eval.metric.quality.threshold = th,
+      prob.mean = T,
+      prob.cv = T,
+      prob.ci = T,
+      prob.ci.alpha = 0.05,
+      prob.median = T,
+      committee.averaging = T,
+      prob.mean.weight = T,
+      prob.mean.weight.decay = 'proportional' )
+  
+  output$EM=myBiomodEM
+  
+  ### Project on new conditions
+  projection=biomod2::BIOMOD_Projection(modeling.output = myBiomodModelOut,new.env = data$eval[,colnames(X)],
+                               proj.name='curr',selected.models = "all",
+                               binary.meth = 'roc')
+  
+  mod_proj=get_predictions(projection, as.data.frame=TRUE)/1000
+  mod_proj$taxa=n
+  
+  tryCatch({
+    forecast=biomod2::BIOMOD_EnsembleForecasting(projection.output = projection,
+                                      EM.output = myBiomodEM)
+    
+    projdf <- cbind(mod_proj,
+                    get_predictions(forecast, as.data.frame=TRUE)/1000)
+      
+    output$projection=projdf
+    saveRDS(output,file=sprintf('predictions/out_%s_%d.rds',n,di))
+    return(output)
+  
+  },
+  
+  
+  error = function(error_condition) {
+    output$projection=mod_proj
+    saveRDS(output,file=sprintf('predictions/out_%s_%d.rds',n,di))
+    
+    print("Ensemble forecasting did not work")
+    return(output)
+  }
+  )  
+}
+```
+
+## Run iteratively on selected taxa for evaluation
+
+```{r}
+m=length(tofit)
+DataSpecies=occur_sel[,(length(subnames)-m+1):length(subnames)]
+Spat=coord[,c("Longitude","Latitude")]
+DataSplitTable <- as.matrix(as.logical(run$RUN1))
+```
+
+
+```{r}
+library(foreach)
+library(doParallel)
+library(parallel)
+
+# cores=detectCores()
+# cl <- makeCluster(cores[1]-1) #not to overload your computer
+```
+
+
+```{r}
+fit=F
+if(fit){
+#registerDoParallel(cl)
+#clusterExport(cl,c('read_data','biomod_fit','tofit','DataSpecies','Spat','DataSplitTable'))
+results_0=lapply(1:m, function(i)    biomod_fit(0,i,DataSpecies,Spat,DataSplitTable))
+results_3=lapply(1:m, function(i)    biomod_fit(3,i,DataSpecies,Spat,DataSplitTable))
+results_5=lapply(1:m, function(i)    biomod_fit(5,i,DataSpecies,Spat,DataSplitTable))
+#registerDoSEQ()
+}
+```
+
+## Synthesis
+
+```{r}
+curr=read.csv('curr.csv',row.names = 1)$tnum+1
+results=list()
+projs=data.frame()
+for (di in c(0,3,5)){
+  eval_df=data.frame()
+  for(j in 1:m){
+    n=tofit[j]
+    sp=subnames[j]
+    if(file.exists(sprintf('predictions/%d/out_%s_%d.rds',di,sp,di))){
+      output=readRDS(sprintf('predictions/%d/out_%s_%d.rds',di,sp,di))
+    }else{
+      output=readRDS(sprintf('predictions/%d/out_%s_%d.rds',di,n,di))
+    }
+    
+    ### Perfs on trainset
+    eval=data.frame(output$eval)
+    
+    ### Ensemble predictions train
+    perfs=data.frame(get_evaluations(output$EM))[,sprintf("%s_EMmedianByTSS_mergedAlgo_mergedRun_mergedData.Testing.data",n)]
+    names(perfs)=c('KAPPA','TSS','ROC')
+    
+    p=dim(eval)[2]-5
+    eval[4,]=c(perfs['TSS'],perfs['ROC'],NA,rep(NA,p),n,'Ensemble')
+    eval$dataset=di
+  
+    eval_df=rbind(eval_df,eval)    
+    
+    
+    ### Prediction on evalset
+    notincols=setdiff(
+                      c(sprintf('%s_AllData_RUN1_GBM',n), sprintf('%s_AllData_RUN2_GBM',n),sprintf('%s_AllData_RUN3_GBM',n),
+                      sprintf('%s_AllData_RUN1_GLM',n), sprintf('%s_AllData_RUN2_GLM',n),sprintf('%s_AllData_RUN3_GLM',n),
+                      sprintf('%s_AllData_RUN1_RF',n), sprintf('%s_AllData_RUN2_RF',n),sprintf('%s_AllData_RUN3_RF',n),
+                      sprintf('%s_EMmedianByTSS_mergedAlgo_mergedRun_mergedData',n)),
+                      colnames(output$projection))
+    
+    if(length(notincols)>0) output$projection[notincols]=0
+    
+    proj=cbind(
+      output$projection$taxa,
+      rowMeans(output$projection[,c(sprintf('%s_AllData_RUN1_GBM',n),sprintf('%s_AllData_RUN2_GBM',n),sprintf('%s_AllData_RUN3_GBM',n))]),
+      rowMeans(output$projection[,c(sprintf('%s_AllData_RUN1_GLM',n),sprintf('%s_AllData_RUN2_GLM',n),sprintf('%s_AllData_RUN3_GLM',n))]),
+      rowMeans(output$projection[,c(sprintf('%s_AllData_RUN1_RF',n),sprintf('%s_AllData_RUN2_RF',n),sprintf('%s_AllData_RUN3_RF',n))]),
+      output$projection[,sprintf('%s_EMmedianByTSS_mergedAlgo_mergedRun_mergedData',n)]
+    )
+    
+    #data.frame(apply(data.frame()[,setdiff(colnames(output$projection),c('taxa'))],1,max))
+    colnames(proj)=c('taxa','GBM','GLM','RF','Ensemble')
+    proj=cbind(proj,data.frame(tid=curr,tcode=subnames[curr]))
+    proj$gid=1:1703
+    proj$dataset=di
+    
+    projs=rbind(projs,proj)
+    
+    ## Evaluate
+    
+  }
+  results[[as.character(di)]]$train=data.frame(eval_df)
+}
+
+results$proj=projs
+
+saveRDS(results,file='predictions/synthesis.rds')
+```
+
+## Performances on train set
+```{r}
+results=readRDS('predictions/synthesis.rds')
+cols=c('TSS','ROC','ACCURACY','taxa','model','dataset')
+train_perfs=rbind(results$'0'$train[,cols],results$'3'$train[,cols],results$'5'$train[,cols])
+write.csv(train_perfs,'predictions/train_perfs2.csv')
+```
+
+
+## Aggregated performances on eval set
+```{r, fig.width=15}
+library(ggplot2)
+library(reshape2)
+pred=subset(results$proj, taxa==tcode)[,c('taxa','GBM','GLM','RF','Ensemble','gid','dataset')]
+pertaxa=aggregate((pred[,c('GBM','GLM','RF','Ensemble')]>=0.5)*1,by=list(dataset=pred$dataset,taxa=pred$taxa),mean)
+overall=aggregate(pertaxa[,c('GBM','GLM','RF','Ensemble')],by=list(dataset=pertaxa$dataset),mean)
+
+aggregate((pred[,c('GBM','GLM','RF','Ensemble')]>=0.5)*1,by=list(dataset=pred$dataset),mean)
+
+write.csv(pred,'predictions/eval_preds.csv')
+write.csv(pertaxa,'predictions/eval_recall_biomod.csv')
+
+data=melt(pred,id.vars = c('taxa','gid','dataset'))
+data$value=as.numeric(data$value)
+ggplot(data,aes(x=taxa,y=value,fill=as.factor(dataset)))+
+  geom_boxplot()+
+  facet_wrap(~variable,ncol=1)+
+  theme(axis.text.x = element_text(angle = 45))
+```
+
+```{r}
+subpertaxa=cbind(0,setdiff(subnames,subpertaxa$taxa),0,0,0,0)
+colnames(subpertaxa)=colnames(pertaxa)
+  
+subpertaxa=rbind(subpertaxa,subset(pertaxa,dataset==0))
+write.csv(subpertaxa,'predictions/biomod_tax_perfs.csv')
+```
+
+
+```{r}
+overall
+ggplot(melt(pertaxa,id.vars = c('dataset','taxa')),aes(x=variable,y=value,col=as.factor(dataset)))+
+  geom_boxplot()
+```
+
+## Evaluate ensemble models on test set
+```{r, fig.height=8, fig.width=8}
+library(ggsignif)
+library(ggpubr)
+all_scores=read.csv('predictions/scores.csv',row.names = 1)
+ggplot(all_scores,aes(x = model, y= ROC, col=as.factor(dataset)))+
+  geom_boxplot()+
+  stat_compare_means()
+
+p1 <- ggboxplot(subset(all_scores,dataset==0 & model!='Ensemble'), x = "model", y = "ROC",palette = "jco",
+          add = "jitter") + stat_compare_means(method = "wilcox.test",ref.group = 'MTEC',show.legend = T, vjust = -0.4)
+
+
+p2 <- ggboxplot(subset(all_scores,dataset==0 & model!='Ensemble'), x = "model", y = "TSS",palette = "jco",
+          add = "jitter") + stat_compare_means(method = "wilcox.test",ref.group = 'MTEC',show.legend = T,vjust = -0.4)
+
+# ggplot(all_scores,aes(x = model, y= TSS, col=as.factor(dataset)))+
+#   geom_boxplot()
+
+gridExtra::grid.arrange(p1,p2,ncol=1,top='Single taxa scores ranking')
+```
+
+```{r, fig.height=5, fig.width=14}
+library(ggsignif)
+library(ggpubr)
+all_scores=read.csv('predictions/taxwise.csv')
+colnames(all_scores)=c('taxa','tss','auc','method')
+
+ggplot(all_scores,aes(x = model, y= ROC, col=as.factor(dataset)))+
+  geom_boxplot()+
+  stat_compare_means()
+
+p1 <- ggboxplot(all_scores, x = "method", y = "auc",palette = "jco",add = "jitter") + stat_compare_means(method = "wilcox.test",ref.group = 'MTEC',show.legend = T, vjust = -0.4)+ylab('ROC AUC')
+
+
+p2 <- ggboxplot(all_scores, x = "method", y = "tss",palette = "jco",add = "jitter") + stat_compare_means(method = "wilcox.test",ref.group = 'MTEC',show.legend = T,vjust = -0.4)+ylab('True Skill Statistic (TSS)')
+
+# ggplot(all_scores,aes(x = model, y= TSS, col=as.factor(dataset)))+
+#   geom_boxplot()
+
+gridExtra::grid.arrange(p1,p2,ncol=2,top='Taxwise predictive scores ranking')
+```
+
+
+```{r, fig.width=15, fig.height=5}
+df=subset(all_scores,dataset==0 & model!='Ensemble')
+df$model=factor(df$model,levels=c('MTEC','RF','GBM','GLM'))
+ggplot(df,aes(x=taxa,y=ROC,fill=model))+
+  geom_bar(stat='identity',position = 'stack')+
+  theme(axis.text.x = element_text(angle=90))
+
+ggplot(df,aes(x=taxa,y=TSS,fill=model))+
+  geom_bar(stat='identity',position = 'stack')+
+  theme(axis.text.x = element_text(angle=90))
+```
+
+
+
+```{r}
+out=sapply(subnames,function(s){
+  d=subset(df,taxa==s)
+  as.character(d[which.max(d$ROC),'model'])
+  })
+
+data.frame(out)
+
+# for (mod in )
+# sapply(c('RF','GLM','GBM'),wilcox.test(subset(df,model=='MTEC')$ROC,subset(df,model==mod)$ROC))
+```
+
+
